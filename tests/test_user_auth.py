@@ -142,9 +142,11 @@ class UserAuthTests(unittest.TestCase):
         resp = self.client.post("/api/user/login", json={"identifier": "9999999999"})
         self.assertEqual(resp.status_code, 400)
 
-    def test_unknown_identifier_returns_404(self):
+    def test_unknown_identifier_does_not_leak_account_existence(self):
         resp = self.client.post("/api/user/login", json={"identifier": "0000000000", "password": "x"})
-        self.assertEqual(resp.status_code, 404)
+        wrong_pw_resp = self.client.post("/api/user/login", json={"identifier": "9999999999", "password": "wrong"})
+        self.assertEqual(resp.status_code, wrong_pw_resp.status_code)
+        self.assertEqual(resp.get_json()["error"], wrong_pw_resp.get_json()["error"])
 
     def test_session_endpoint_reports_logged_out_by_default(self):
         resp = self.client.get("/api/user/session")
@@ -161,6 +163,16 @@ class UserAuthTests(unittest.TestCase):
     def test_protected_route_rejects_unauthenticated_request(self):
         resp = self.client.get("/api/user/credit-history")
         self.assertEqual(resp.status_code, 401)
+
+    def test_dashboard_page_redirects_to_login_when_not_authenticated(self):
+        resp = self.client.get("/dashboard", follow_redirects=False)
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/login", resp.headers["Location"])
+
+    def test_dashboard_page_loads_after_login(self):
+        self.client.post("/api/user/login", json={"identifier": "9999999999", "password": "CorrectHorse123!"})
+        resp = self.client.get("/dashboard")
+        self.assertEqual(resp.status_code, 200)
 
 
 if __name__ == "__main__":

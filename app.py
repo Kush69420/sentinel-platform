@@ -41,6 +41,7 @@ from flask import (
     Flask,
     Response,
     jsonify,
+    redirect,
     render_template,
     request,
     send_from_directory,
@@ -326,6 +327,8 @@ def login_page():
 
 @app.route("/dashboard")
 def dashboard_page():
+    if not session.get("is_user"):
+        return redirect("/login")
     return render_template("dashboard.html")
 
 
@@ -610,7 +613,9 @@ def user_login():
     if not user:
         conn.close()
         log_activity(None, "failed_login", f"Unknown identifier attempted login from {ip}: {identifier[:32]}")
-        return jsonify({"error": "User not found. Please register or wait for LEA approval."}), 404
+        # Same status/message as a wrong-password rejection below — a distinguishable
+        # response here would let an attacker enumerate which phone/email is registered.
+        return jsonify({"error": "Invalid credentials"}), 401
 
     # Lockout check
     limit = int(get_setting("user_failed_login_limit", os.getenv("FAILED_LOGIN_LIMIT", "5")))
