@@ -30,6 +30,10 @@ class FakeCursor:
             u = next((u for u in self.db["bot_users"].values() if u["phone"] == identifier or u.get("official_email") == identifier), None)
             self._result = [dict(u)] if u else []
 
+        elif q.startswith("SELECT id, phone, name, department, credits, status, plan_id FROM bot_users WHERE id=%s"):
+            u = self.db["bot_users"].get(params[0])
+            self._result = [dict(u)] if u else []
+
         elif q.startswith("UPDATE bot_users SET failed_login_count=%s, locked_until=DATE_ADD"):
             failed_count, lockout_hours, user_id = params
             self.db["bot_users"][user_id]["failed_login_count"] = failed_count
@@ -173,6 +177,20 @@ class UserAuthTests(unittest.TestCase):
         self.client.post("/api/user/login", json={"identifier": "9999999999", "password": "CorrectHorse123!"})
         resp = self.client.get("/dashboard")
         self.assertEqual(resp.status_code, 200)
+
+    def test_api_me_requires_login(self):
+        resp = self.client.get("/api/me?phone=9999999999")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_api_me_ignores_phone_param_and_returns_only_the_caller_own_account(self):
+        # Logged in as user 2 (8888888888), but requesting another account's phone.
+        with self.client.session_transaction() as sess:
+            sess["is_user"] = True
+            sess["user_id"] = 2
+            sess["user_phone"] = "8888888888"
+        resp = self.client.get("/api/me?phone=9999999999")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["phone"], "8888888888")
 
 
 if __name__ == "__main__":

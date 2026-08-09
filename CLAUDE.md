@@ -1,17 +1,5 @@
 # SENTINEL Platform — AI Context
 
-## Known Issues / Security Debt (pre-existing, not yet patched)
-
-Found during the Day 1 (§3.1 mobile_lookup credit/audit) security review — out
-of Mobile OSINT scope, but should be fixed before the affected feature goes live.
-
-- **`/api/me` (`app.py`) has no authentication check** — it accepts a `phone`
-  query param and returns that user's `credits`, `status`, and `plan_id` for
-  *any* phone number, no session/login required. This is an IDOR: anyone who
-  can guess or enumerate a phone number can read another user's account data.
-  Needs a `@user_required` (or equivalent) check scoping it to the caller's own
-  session, the same way `/api/user/profile` and `/api/user/credit-history` do.
-
 ## Future / Deferred Modules
 
 ### UPI / Financial Registry Verification (not scheduled — post Mobile-OSINT-go-live)

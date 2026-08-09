@@ -1355,13 +1355,13 @@ def smtp_test():
 # PUBLIC USER/SERVICE APIs
 # ─────────────────────────────────────────────
 @app.route("/api/me", methods=["GET"])
+@user_required
 def get_current_user():
-    phone = request.args.get("phone")
-    if not phone:
-        return jsonify({"error": "phone required"}), 400
+    # Scoped to the caller's own session — any `phone` query param is ignored,
+    # so a logged-in user can't read another account by guessing its number.
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, phone, name, department, credits, status, plan_id FROM bot_users WHERE phone=%s", (phone,))
+    cursor.execute("SELECT id, phone, name, department, credits, status, plan_id FROM bot_users WHERE id=%s", (session.get("user_id"),))
     user = cursor.fetchone()
     conn.close()
     if not user:
