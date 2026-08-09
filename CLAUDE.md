@@ -1,5 +1,12 @@
 # SENTINEL Platform — AI Context
 
+## Reminder (2026-08-10)
+
+Follow up on the "Known Issues / Security Debt" list below — start with the
+three Critical items (stored XSS in the admin LEA verification queue,
+hardcoded default admin credential, unauthenticated CDR/IPDR workspace
+endpoint). Nothing in that list has been fixed yet as of 2026-08-09.
+
 ## Known Issues / Security Debt (pre-existing, not yet patched)
 
 Found during a full-codebase security sweep (2026-08-09), after Day 1 (§3.1
