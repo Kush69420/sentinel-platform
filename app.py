@@ -2314,10 +2314,18 @@ def log_service_usage_internal(phone, service_code, case_reference, input_summar
             if not service or not user:
                 return
             is_free = bool(service["is_free"])
-            credits_charged = 0 if is_free else int(service["credits_per_use"])
-            if credits_charged and user["credits"] >= credits_charged:
-                cursor.execute("UPDATE bot_users SET credits=credits-%s WHERE id=%s", (credits_charged, user["id"]))
-                cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'debit',%s,%s)", (phone, credits_charged, f"service:{service_code}"))
+            credits_required = 0 if is_free else int(service["credits_per_use"])
+            credits_charged = 0
+            if credits_required:
+                # Atomic check-and-deduct — mirrors run_tool_generic()'s guard so two
+                # concurrent CDR/IPDR requests can't both pass a stale balance check.
+                cursor.execute(
+                    "UPDATE bot_users SET credits = credits - %s WHERE id = %s AND credits >= %s",
+                    (credits_required, user["id"], credits_required),
+                )
+                if cursor.rowcount:
+                    credits_charged = credits_required
+                    cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'debit',%s,%s)", (phone, credits_charged, f"service:{service_code}"))
             cursor.execute(
                 "INSERT INTO service_usage_log (user_id, service_id, case_reference, input_summary, credits_charged) VALUES (%s,%s,%s,%s,%s)",
                 (user["id"], service["id"], case_reference, input_summary, credits_charged),
