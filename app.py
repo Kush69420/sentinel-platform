@@ -1406,6 +1406,25 @@ def user_profile():
     return jsonify({"user": user, "twofa_mandatory": True})
 
 
+@app.route("/api/user/credit-history", methods=["GET"])
+@user_required
+def user_credit_history():
+    """The logged-in user's own credit_transactions — filtered by their own session
+    phone only, never a caller-supplied identifier, so there's no IDOR here."""
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT id, type, amount, reason, status, created_at FROM credit_transactions WHERE phone=%s ORDER BY created_at DESC LIMIT 100",
+        (session.get("user_phone"),),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return jsonify({"transactions": rows})
+
+
 @app.route("/api/user/password-change", methods=["POST"])
 def user_password_change():
     if not session.get("is_user"):
@@ -1619,23 +1638,75 @@ def run_tool_generic():
     # 1) Native database lookup tools — no API dependency required.
     try:
         if code in {"mobile_lookup", "subscriber_lookup"}:
+            user_id = session.get("user_id")
+            user_phone = session.get("user_phone")
+            credits_required = 0 if (service and service.get("is_free")) else int((service or {}).get("credits_per_use") or 0)
+            case_reference = str(data.get("case_reference") or "").strip()[:100] or None
+
+            # Pre-flight balance check — block before running any query, per the billing plan.
+            if credits_required and user_id:
+                cursor.execute("SELECT credits FROM bot_users WHERE id=%s", (user_id,))
+                balance_row = cursor.fetchone()
+                current_credits = balance_row["credits"] if balance_row else 0
+                if current_credits < credits_required:
+                    conn.close()
+                    return jsonify({"error": "Insufficient credits for this search.", "credits_required": credits_required, "credits_available": current_credits}), 402
+
+            def _record_search(found: bool, source: str):
+                """Atomically charge a credit on a match, then always write the search_logs
+                audit row (found or not) — that's the actual compliance record.
+                Returns the amount charged, or None if a concurrent request won the race
+                for the last credit (caller must treat this as insufficient-credits)."""
+                charged = 0
+                if found and credits_required and user_id:
+                    cursor.execute(
+                        "UPDATE bot_users SET credits = credits - %s WHERE id = %s AND credits >= %s",
+                        (credits_required, user_id, credits_required),
+                    )
+                    if cursor.rowcount == 0:
+                        conn.rollback()
+                        return None
+                    charged = credits_required
+                    cursor.execute(
+                        "INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'debit',%s,%s)",
+                        (user_phone, charged, f"service:{code}"),
+                    )
+                if user_id:
+                    cursor.execute(
+                        "INSERT INTO search_logs (user_id, phone, search_type, query_value, case_reference, credits_used, sources_queried) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (user_id, user_phone, "mobile", query, case_reference, charged, source),
+                    )
+                conn.commit()
+                return charged
+
             cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query,))
             row = cursor.fetchone()
             if row:
+                charged = _record_search(True, "Subscriber Database")
+                if charged is None:
+                    conn.close()
+                    return jsonify({"error": "Insufficient credits for this search.", "credits_required": credits_required}), 402
                 conn.close()
-                return jsonify({"success": True, "tool": code, "query": query, "results": [{"source": "Subscriber Database", "status": "ok", "data": _json_clean(row)}]})
+                return jsonify({"success": True, "tool": code, "query": query, "credits_charged": charged, "results": [{"source": "Subscriber Database", "status": "ok", "data": _json_clean(row)}]})
             # Fallback to generic uploaded records if old importer was used.
             try:
                 cursor.execute("SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND (record_key=%s OR data_json LIKE %s) ORDER BY created_at DESC LIMIT 20", (query, f"%{query}%"))
                 rows = cursor.fetchall()
                 if rows:
+                    charged = _record_search(True, "Uploaded Master Data")
+                    if charged is None:
+                        conn.close()
+                        return jsonify({"error": "Insufficient credits for this search.", "credits_required": credits_required}), 402
                     for r in rows:
                         try: r["data"] = json.loads(r.get("data_json") or "{}")
                         except Exception: r["data"] = r.get("data_json")
                     conn.close()
-                    return jsonify({"success": True, "tool": code, "query": query, "results": [{"source": "Uploaded Master Data", "status": "ok", "data": rows}]})
+                    return jsonify({"success": True, "tool": code, "query": query, "credits_charged": charged, "results": [{"source": "Uploaded Master Data", "status": "ok", "data": rows}]})
             except Exception:
                 pass
+            # Neither source matched — log the attempt for the audit trail, but charge nothing.
+            _record_search(False, "No match")
 
         if code == "vehicle_lookup":
             cursor.execute("SELECT * FROM vehicle_records WHERE registration_number=%s LIMIT 1", (query,))
