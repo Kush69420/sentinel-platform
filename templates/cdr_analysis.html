@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+<title>SENTINEL — CDR / IPDR Analysis</title>
+<link rel="stylesheet" href="/static/theme.css"/>
+<style>
+/* ===== Page shell ===== */
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--bg);color:var(--text);font-family:var(--sans);
+  -webkit-font-smoothing:antialiased;overflow:hidden;
+}
+.wrap{display:flex;flex-direction:column;height:100dvh}
+
+/* ===== Top bar ===== */
+.topbar{
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:12px 16px;background:var(--surface);
+  border-bottom:1px solid var(--border);
+}
+.brand{display:flex;align-items:center;gap:11px;min-width:0}
+.brand .glyph{width:36px;height:36px;border-radius:10px;flex:0 0 auto;
+  background:linear-gradient(135deg,var(--primary),var(--secondary));
+  display:grid;place-items:center;color:#06283a;font-weight:800;font-size:18px}
+.brand h1{font-size:15px;margin:0;letter-spacing:.3px;white-space:nowrap}
+.brand p{font:600 10px/1 var(--mono);color:var(--muted);margin:3px 0 0;letter-spacing:1px}
+.topbar .spacer{flex:1}
+.modepick{display:flex;background:var(--bg);border:1px solid var(--border-strong);border-radius:10px;padding:3px}
+.modepick button{border:0;background:transparent;color:var(--muted);font:600 12px var(--sans);
+  padding:7px 14px;border-radius:7px;cursor:pointer}
+.modepick button.on{background:var(--primary);color:#06283a}
+
+/* ===== Insight strip ===== */
+.insights{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;
+  padding:12px 16px;background:var(--bg);border-bottom:1px solid var(--border)}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px;position:relative;overflow:hidden}
+.kpi:before{content:"";position:absolute;inset:0 0 auto 0;height:2px;background:var(--accent,var(--primary))}
+.kpi .lbl{font:600 10px/1 var(--mono);color:var(--muted);letter-spacing:.6px;text-transform:uppercase}
+.kpi .val{font:700 24px/1.1 var(--mono);color:var(--accent,var(--primary));margin-top:8px}
+.kpi .sub{font-size:11px;color:var(--muted);margin-top:4px}
+
+/* ===== Toolbar ===== */
+.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:10px 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+.search{position:relative;flex:1;min-width:200px;max-width:460px}
+.search svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--muted)}
+.search input{padding-left:36px}
+.tool-sep{width:1px;height:24px;background:var(--border-strong);margin:0 2px}
+.chip{display:inline-flex;align-items:center;gap:6px;font:600 12px var(--sans);
+  background:var(--card);border:1px solid var(--border-strong);color:var(--text);
+  border-radius:999px;padding:6px 12px;cursor:pointer;white-space:nowrap}
+.chip:hover{border-color:var(--primary)}
+.chip.active{background:rgba(56,189,248,.14);border-color:var(--primary);color:var(--primary)}
+.chip .x{font-size:14px;line-height:1;opacity:.7}
+.filterbar{display:flex;gap:8px;flex-wrap:wrap;padding:0 16px 10px;background:var(--surface);border-bottom:1px solid var(--border)}
+.filterbar:empty{display:none;padding:0}
+
+/* ===== Spreadsheet grid ===== */
+.gridhost{flex:1;min-height:0;position:relative;background:var(--bg)}
+.grid-scroll{position:absolute;inset:0;overflow:auto}
+table.sheet{border-collapse:separate;border-spacing:0;font:13px/1.35 var(--mono);min-width:100%}
+table.sheet th,table.sheet td{
+  border-right:1px solid var(--border);border-bottom:1px solid var(--border);
+  padding:0;white-space:nowrap;background:var(--bg)}
+table.sheet thead th{
+  position:sticky;top:0;z-index:6;background:var(--surface);
+  font:600 11px var(--sans);letter-spacing:.4px;color:var(--text);
+  text-transform:uppercase;user-select:none}
+.th-inner{display:flex;align-items:center;gap:6px;padding:9px 10px;cursor:pointer}
+.th-inner .label{overflow:hidden;text-overflow:ellipsis}
+.th-inner .sort{font-size:10px;color:var(--primary);width:10px}
+.th-inner .menu{margin-left:auto;opacity:.55;font-size:13px;padding:0 2px;border-radius:5px}
+.th-inner .menu:hover{opacity:1;background:var(--card)}
+.th-inner.filtered{box-shadow:inset 0 -2px 0 var(--secondary)}
+td .cell{display:block;padding:8px 10px;overflow:hidden;text-overflow:ellipsis;max-width:340px}
+tbody tr:nth-child(even) td{background:#16233b}
+tbody tr:hover td{background:rgba(56,189,248,.08)}
+/* row number + freeze */
+.rownum{position:sticky;left:0;z-index:5;background:var(--surface)!important;
+  color:var(--muted);text-align:right;font:600 11px var(--mono);min-width:54px}
+.rownum .cell{padding:8px 10px}
+thead .rownum{z-index:7}
+td.frozen,th.frozen{position:sticky;z-index:5;background:var(--surface)!important}
+thead th.frozen{z-index:7}
+td.frozen{background:#1a2740!important}
+.col-enriched .cell{color:var(--secondary)}
+.hl{background:rgba(245,158,11,.32);border-radius:3px;color:#fff;padding:0 1px}
+
+/* ===== Footer / pagination ===== */
+.footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:9px 16px;background:var(--surface);border-top:1px solid var(--border);font-size:12px}
+.footer .muted{color:var(--muted)}
+.pager{display:flex;align-items:center;gap:4px;margin-left:auto}
+.pager button{min-width:30px;height:30px;border:1px solid var(--border-strong);background:var(--card);
+  color:var(--text);border-radius:8px;cursor:pointer;font:600 12px var(--mono)}
+.pager button:disabled{opacity:.4;cursor:default}
+.pager button.on{background:var(--primary);border-color:var(--primary);color:#06283a}
+.footer select{background:var(--card);color:var(--text);border:1px solid var(--border-strong);
+  border-radius:8px;padding:5px 8px;font:600 12px var(--sans)}
+
+/* ===== Dropdown menu (column) ===== */
+.popmenu{position:fixed;z-index:60;background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:12px;box-shadow:var(--shadow-lg);min-width:230px;padding:6px;display:none}
+.popmenu.show{display:block}
+.popmenu .mi{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:8px;cursor:pointer;font:500 13px var(--sans)}
+.popmenu .mi:hover{background:var(--card)}
+.popmenu .mi.sep{border-top:1px solid var(--border);margin:4px 0;padding:0;height:0;pointer-events:none}
+.popmenu .flt{padding:8px 8px 4px}
+.popmenu .flt input{margin-bottom:6px}
+.fvals{max-height:200px;overflow:auto;padding:2px}
+.fval{display:flex;align-items:center;gap:8px;padding:6px 7px;border-radius:7px;cursor:pointer;font:500 12px var(--mono)}
+.fval:hover{background:var(--card)}
+.fval input{accent-color:var(--primary);width:15px;height:15px}
+.fval .cnt{margin-left:auto;color:var(--muted);font-size:11px}
+.popmenu .frow{display:flex;gap:6px;padding:8px 6px 4px}
+
+/* ===== Columns panel ===== */
+.drawer{position:fixed;inset:0;z-index:80;display:none}
+.drawer.show{display:block}
+.drawer .scrim{position:absolute;inset:0;background:rgba(2,6,23,.6)}
+.drawer .panel{position:absolute;top:0;right:0;height:100%;width:min(340px,90vw);
+  background:var(--surface);border-left:1px solid var(--border-strong);
+  box-shadow:var(--shadow-lg);display:flex;flex-direction:column}
+.drawer .phead{display:flex;align-items:center;justify-content:space-between;
+  padding:16px;border-bottom:1px solid var(--border)}
+.drawer .phead h3{margin:0;font-size:15px}
+.drawer .pbody{flex:1;overflow:auto;padding:10px}
+.colrow{display:flex;align-items:center;gap:10px;padding:10px;border-radius:9px}
+.colrow:hover{background:var(--card)}
+.colrow input{accent-color:var(--primary);width:16px;height:16px}
+.colrow .grip{color:var(--muted);cursor:grab;font-size:14px}
+
+/* ===== Charts ===== */
+.viz{display:none;padding:16px;gap:14px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+  background:var(--bg);overflow:auto}
+.viz.show{display:grid}
+.vcard{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px}
+.vcard h4{margin:0 0 12px;font-size:13px;color:var(--text);display:flex;align-items:center;gap:8px}
+.vcard h4 .dot{width:8px;height:8px;border-radius:50%;background:var(--accent,var(--primary))}
+.bar{display:flex;align-items:center;gap:10px;margin-bottom:9px;font:500 12px var(--mono)}
+.bar .name{width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.bar .track{flex:1;height:18px;background:var(--bg);border-radius:6px;overflow:hidden}
+.bar .fill{height:100%;background:linear-gradient(90deg,var(--primary),var(--secondary));border-radius:6px}
+.bar .num{width:46px;text-align:right;color:var(--text)}
+.hours{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;align-items:end;height:130px}
+.hours .hr{background:var(--primary);border-radius:3px 3px 0 0;min-height:3px;position:relative}
+.hours .hr:hover{background:var(--secondary)}
+.hours .hr small{position:absolute;bottom:-16px;left:50%;transform:translateX(-50%);font-size:8px;color:var(--muted)}
+
+/* ===== Empty / loading ===== */
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  height:100%;gap:14px;color:var(--muted);text-align:center;padding:24px}
+.empty .ic{width:64px;height:64px;border-radius:18px;background:var(--surface);
+  border:1px solid var(--border);display:grid;place-items:center;font-size:30px}
+.dropzone{border:2px dashed var(--border-strong);border-radius:16px;padding:30px 40px;
+  cursor:pointer;transition:border-color .15s,background .15s}
+.dropzone:hover,.dropzone.over{border-color:var(--primary);background:rgba(56,189,248,.06)}
+.spinner{width:34px;height:34px;border:3px solid var(--card);border-top-color:var(--primary);
+  border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ===== Toast ===== */
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(20px);
+  background:var(--surface);border:1px solid var(--primary);color:var(--text);
+  padding:11px 18px;border-radius:12px;font:600 13px var(--sans);box-shadow:var(--shadow-lg);
+  opacity:0;pointer-events:none;transition:.25s;z-index:90}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:var(--danger)}
+
+/* ===== Responsive ===== */
+@media(max-width:760px){
+  .brand p{display:none}
+  .insights{grid-template-columns:repeat(2,1fr)}
+  .search{max-width:none;order:-1;flex-basis:100%}
+  td .cell{max-width:200px}
+  .chip span.t{display:none}
+}
+@media(max-width:480px){
+  .insights{grid-template-columns:1fr 1fr;padding:10px}
+  .kpi .val{font-size:20px}
+  .topbar{padding:10px}
+}
+</style>
+</head>
+<body class="sentinel-theme">
+<div class="wrap">
+
+  <!-- TOP BAR -->
+  <div class="topbar">
+    <div class="brand">
+      <div class="glyph">◎</div>
+      <div>
+        <h1>CDR / IPDR Analysis</h1>
+        <p>FORENSIC SPREADSHEET · LARGE-DATA · OFFLINE-CAPABLE</p>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="modepick" id="modePick">
+      <button class="on" data-mode="cdr">CDR</button>
+      <button data-mode="ipdr">IPDR</button>
+    </div>
+    <button class="s-btn ghost" id="btnUpload">⬆ Load file</button>
+    <button class="s-btn" id="btnViz">📊 Charts</button>
+    <button class="s-btn" id="btnCols">▦ Columns</button>
+    <button class="s-btn primary" id="btnExport">⬇ Export CSV</button>
+    <input type="file" id="fileInput" accept=".csv,.tsv,.txt" hidden/>
+  </div>
+
+  <!-- KPI INSIGHTS -->
+  <div class="insights" id="insights" style="display:none">
+    <div class="kpi" style="--accent:var(--primary)"><div class="lbl">Records</div><div class="val" id="kRecords">—</div><div class="sub" id="kShown">shown after filters</div></div>
+    <div class="kpi" style="--accent:var(--secondary)"><div class="lbl">Unique numbers</div><div class="val" id="kUnique">—</div><div class="sub">A & B parties</div></div>
+    <div class="kpi" style="--accent:var(--success)"><div class="lbl">Total duration</div><div class="val" id="kDur">—</div><div class="sub" id="kAvg">avg / call</div></div>
+    <div class="kpi" style="--accent:var(--warning)"><div class="lbl">Peak hour</div><div class="val" id="kPeak">—</div><div class="sub" id="kPeakDay">busiest day</div></div>
+    <div class="kpi" style="--accent:var(--danger)"><div class="lbl">Top contact</div><div class="val" id="kTop" style="font-size:15px">—</div><div class="sub" id="kTopN">most frequent B-party</div></div>
+  </div>
+
+  <!-- TOOLBAR -->
+  <div class="toolbar">
+    <div class="search">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4-4"/></svg>
+      <input id="globalSearch" class="s-input" placeholder="Search all columns…  (Aadhaar, IMEI, number, tower, time)"/>
+    </div>
+    <div class="tool-sep"></div>
+    <button class="chip" id="btnFreeze">❄ <span class="t">Freeze</span> <b id="freezeN">2</b></button>
+    <button class="chip" id="btnClearFilters" style="display:none">✕ Clear filters</button>
+    <span class="muted" id="matchInfo" style="font:600 12px var(--mono);color:var(--muted)"></span>
+  </div>
+  <div class="filterbar" id="filterbar"></div>
+
+  <!-- GRID -->
+  <div class="gridhost">
+    <div class="grid-scroll" id="gridScroll">
+      <div class="empty" id="emptyState">
+        <div class="ic">📄</div>
+        <div style="max-width:420px">
+          <div style="font-size:15px;color:var(--text);font-weight:600;margin-bottom:6px">No data loaded</div>
+          <div>Drop a CDR or IPDR <b>CSV</b> here, or click below. Everything runs in your browser — large files render smoothly via virtual scrolling.</div>
+        </div>
+        <div class="dropzone" id="dropzone">⬆ Choose CDR / IPDR CSV</div>
+        <button class="s-btn ghost" id="btnDemo">Load demo dataset</button>
+      </div>
+      <table class="sheet" id="sheet" style="display:none">
+        <thead id="sheetHead"></thead>
+        <tbody id="sheetBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- CHARTS -->
+  <div class="viz" id="viz">
+    <div class="vcard"><h4><span class="dot" style="--accent:var(--primary)"></span>Top contacts (B-party)</h4><div id="vizTop"></div></div>
+    <div class="vcard"><h4><span class="dot" style="--accent:var(--secondary)"></span>Activity by hour of day</h4><div class="hours" id="vizHours"></div><div style="height:18px"></div></div>
+    <div class="vcard"><h4><span class="dot" style="--accent:var(--success)"></span>Call-type / protocol mix</h4><div id="vizTypes"></div></div>
+    <div class="vcard"><h4><span class="dot" style="--accent:var(--warning)"></span>Frequent contact pairs</h4><div id="vizPairs"></div></div>
+  </div>
+
+  <!-- FOOTER / PAGINATION -->
+  <div class="footer">
+    <span class="muted" id="footStatus">Ready</span>
+    <span class="tool-sep" style="height:18px"></span>
+    <label class="muted">Rows/page
+      <select id="pageSize"><option>50</option><option selected>100</option><option>250</option><option>500</option><option value="0">All</option></select>
+    </label>
+    <div class="pager" id="pager"></div>
+  </div>
+</div>
+
+<!-- column menu + drawer + toast -->
+<div class="popmenu" id="colMenu"></div>
+<div class="drawer" id="colDrawer">
+  <div class="scrim" data-close></div>
+  <div class="panel">
+    <div class="phead"><h3>Columns</h3><button class="s-btn ghost" data-close>✕</button></div>
+    <div class="pbody" id="colList"></div>
+    <div style="padding:12px;border-top:1px solid var(--border);display:flex;gap:8px">
+      <button class="s-btn ghost" id="colAll" style="flex:1">Show all</button>
+      <button class="s-btn ghost" id="colNone" style="flex:1">Hide all</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script src="/static/cdr_analysis.js"></script>
+</body>
+</html>
