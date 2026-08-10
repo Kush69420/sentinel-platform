@@ -37,6 +37,11 @@ import pyotp
 import qrcode
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from flask import (
     Flask,
     Response,
@@ -1660,8 +1665,9 @@ def run_tool_generic():
             def _record_search(found: bool, source: str):
                 """Atomically charge a credit on a match, then always write the search_logs
                 audit row (found or not) — that's the actual compliance record.
-                Returns the amount charged, or None if a concurrent request won the race
-                for the last credit (caller must treat this as insufficient-credits)."""
+                Returns (amount charged, search_log_id), or (None, None) if a concurrent
+                request won the race for the last credit (caller must treat this as
+                insufficient-credits)."""
                 charged = 0
                 if found and credits_required and user_id:
                     cursor.execute(
@@ -1670,36 +1676,38 @@ def run_tool_generic():
                     )
                     if cursor.rowcount == 0:
                         conn.rollback()
-                        return None
+                        return None, None
                     charged = credits_required
                     cursor.execute(
                         "INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'debit',%s,%s)",
                         (user_phone, charged, f"service:{code}"),
                     )
+                search_log_id = None
                 if user_id:
                     cursor.execute(
                         "INSERT INTO search_logs (user_id, phone, search_type, query_value, case_reference, credits_used, sources_queried) "
                         "VALUES (%s,%s,%s,%s,%s,%s,%s)",
                         (user_id, user_phone, "mobile", query, case_reference, charged, source),
                     )
+                    search_log_id = cursor.lastrowid
                 conn.commit()
-                return charged
+                return charged, search_log_id
 
             cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query,))
             row = cursor.fetchone()
             if row:
-                charged = _record_search(True, "Subscriber Database")
+                charged, search_log_id = _record_search(True, "Subscriber Database")
                 if charged is None:
                     conn.close()
                     return jsonify({"error": "Insufficient credits for this search.", "credits_required": credits_required}), 402
                 conn.close()
-                return jsonify({"success": True, "tool": code, "query": query, "credits_charged": charged, "results": [{"source": "Subscriber Database", "status": "ok", "data": _json_clean(row)}]})
+                return jsonify({"success": True, "tool": code, "query": query, "credits_charged": charged, "search_log_id": search_log_id, "results": [{"source": "Subscriber Database", "status": "ok", "data": _json_clean(row)}]})
             # Fallback to generic uploaded records if old importer was used.
             try:
                 cursor.execute("SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND (record_key=%s OR data_json LIKE %s) ORDER BY created_at DESC LIMIT 20", (query, f"%{query}%"))
                 rows = cursor.fetchall()
                 if rows:
-                    charged = _record_search(True, "Uploaded Master Data")
+                    charged, search_log_id = _record_search(True, "Uploaded Master Data")
                     if charged is None:
                         conn.close()
                         return jsonify({"error": "Insufficient credits for this search.", "credits_required": credits_required}), 402
@@ -1707,7 +1715,7 @@ def run_tool_generic():
                         try: r["data"] = json.loads(r.get("data_json") or "{}")
                         except Exception: r["data"] = r.get("data_json")
                     conn.close()
-                    return jsonify({"success": True, "tool": code, "query": query, "credits_charged": charged, "results": [{"source": "Uploaded Master Data", "status": "ok", "data": rows}]})
+                    return jsonify({"success": True, "tool": code, "query": query, "credits_charged": charged, "search_log_id": search_log_id, "results": [{"source": "Uploaded Master Data", "status": "ok", "data": rows}]})
             except Exception:
                 pass
             # Neither source matched — log the attempt for the audit trail, but charge nothing.
@@ -1825,6 +1833,122 @@ def run_tool_generic():
     return jsonify({"success": False, "error": f"No working connector/data found for tool '{code}'. Configure API dependency or upload database.", "errors": errors}), 400
 
 
+SUBSCRIBER_REPORT_FIELDS = [
+    ("mobile_number", "Mobile Number"),
+    ("subscriber_name", "Subscriber Name"),
+    ("father_name", "Father's Name"),
+    ("address", "Address"),
+    ("district", "District"),
+    ("state", "State"),
+    ("operator", "Operator"),
+    ("sim_type", "SIM Type"),
+    ("activation_date", "Activation Date"),
+    ("status", "Status"),
+    ("alternate_number", "Alternate Number"),
+    ("email", "Email"),
+    ("id_type", "ID Type"),
+    ("id_number", "ID Number"),
+]
+
+
+def _build_mobile_lookup_pdf(log: dict, record: dict) -> bytes:
+    """Render a search_logs row + its subscriber record as a PDF report."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("SentinelTitle", parent=styles["Title"], fontSize=18, textColor=colors.HexColor("#0e1a29"))
+    meta_style = ParagraphStyle("SentinelMeta", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#444444"), leading=13)
+    footer_style = ParagraphStyle("SentinelFooter", parent=styles["Normal"], fontSize=7.5, textColor=colors.HexColor("#777777"))
+
+    app_name = get_setting("app_name", "SENTINEL")
+    disclaimer = get_setting("login_notice", "Restricted access only. For authorized law-enforcement use.")
+
+    created_at = log.get("created_at")
+    created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_at, "strftime") else str(created_at or "")
+
+    story = [
+        Paragraph(f"{app_name} — Mobile Lookup Report", title_style),
+        Spacer(1, 4 * mm),
+        Paragraph(
+            f"Case Reference: {log.get('case_reference') or '—'}<br/>"
+            f"Search Log ID: {log.get('id')}<br/>"
+            f"Queried Number: {log.get('query_value')}<br/>"
+            f"Searched At: {created_at_str}<br/>"
+            f"Source: {log.get('sources_queried') or '—'}<br/>"
+            f"Requested By: {session.get('user_name', 'Operator')} ({session.get('user_department') or '—'})",
+            meta_style,
+        ),
+        Spacer(1, 6 * mm),
+    ]
+
+    table_data = [["Field", "Value"]]
+    for key, label in SUBSCRIBER_REPORT_FIELDS:
+        value = record.get(key)
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        table_data.append([label, str(value) if value not in (None, "") else "—"])
+
+    table = Table(table_data, colWidths=[50 * mm, 110 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e1a29")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f7fa")]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 10 * mm))
+    story.append(Paragraph(disclaimer, footer_style))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+@app.route("/api/tools/run/report/pdf/<int:search_log_id>", methods=["GET"])
+@user_required
+def mobile_lookup_report_pdf(search_log_id):
+    """Re-format an already-paid-for mobile_lookup search as a PDF. No new credit charge,
+    no new search_logs row — this reads back a prior search, scoped to the caller."""
+    user_id = session.get("user_id")
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM search_logs WHERE id=%s AND user_id=%s", (search_log_id, user_id))
+    log = cursor.fetchone()
+    if not log:
+        conn.close()
+        return jsonify({"error": "Report not found."}), 404
+    if not log.get("credits_used") or (log.get("sources_queried") or "").strip().lower() == "no match":
+        conn.close()
+        return jsonify({"error": "No successful search found for this record — nothing to report."}), 400
+
+    query_value = log.get("query_value") or ""
+    cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query_value,))
+    record = cursor.fetchone()
+    if not record:
+        cursor.execute(
+            "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND (record_key=%s OR data_json LIKE %s) ORDER BY created_at DESC LIMIT 1",
+            (query_value, f"%{query_value}%"),
+        )
+        fallback = cursor.fetchone()
+        if fallback:
+            try:
+                record = json.loads(fallback.get("data_json") or "{}")
+            except Exception:
+                record = {}
+    conn.close()
+    if not record:
+        return jsonify({"error": "Underlying subscriber record no longer exists."}), 404
+
+    pdf_bytes = _build_mobile_lookup_pdf(log, record)
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=sentinel_mobile_lookup_{search_log_id}.pdf"},
+    )
 
 
 # ─────────────────────────────────────────────

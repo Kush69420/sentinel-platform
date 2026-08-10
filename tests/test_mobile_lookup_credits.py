@@ -19,6 +19,7 @@ class FakeCursor:
         self.dictionary = dictionary
         self._result = []
         self.rowcount = 0
+        self.lastrowid = None
 
     def execute(self, query, params=()):
         q = " ".join(query.split())  # normalize whitespace
@@ -54,6 +55,7 @@ class FakeCursor:
                 {"user_id": user_id, "phone": phone, "search_type": search_type, "query_value": query_value,
                  "case_reference": case_reference, "credits_used": credits_used, "sources_queried": source}
             )
+            self.lastrowid = len(self.db["search_logs"])
 
         elif q.startswith("SELECT * FROM subscriber_records WHERE mobile_number=%s"):
             row = self.db["subscriber_records"].get(params[0])
@@ -143,6 +145,7 @@ class MobileLookupCreditTests(unittest.TestCase):
         body = resp.get_json()
         self.assertTrue(body["success"])
         self.assertEqual(body["credits_charged"], 2)
+        self.assertEqual(body["search_log_id"], 1)
         self.assertEqual(self.db["bot_users"][1]["credits"], 3)  # 5 - 2
         self.assertEqual(len(self.db["credit_transactions"]), 1)
         self.assertEqual(self.db["credit_transactions"][0]["amount"], 2)
