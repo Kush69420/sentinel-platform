@@ -2646,6 +2646,7 @@ def import_batches_v2():
     return jsonify(rows)
 
 @app.route('/api/analysis/workspace/<int:batch_id>', methods=['GET'])
+@admin_required
 def analysis_workspace_v2(batch_id):
     conn = get_db()
     cur = conn.cursor(dictionary=True)
@@ -2833,6 +2834,7 @@ def analysis_workspace_v2(batch_id):
 
 
 @app.route('/workspace/<int:batch_id>')
+@admin_required
 def workspace_page(batch_id):
     return render_template('workspace.html', batch_id=batch_id)
 
