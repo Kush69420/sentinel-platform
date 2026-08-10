@@ -2,44 +2,36 @@
 
 ## Reminder (2026-08-10)
 
-Follow up on the "Known Issues / Security Debt" list below — start with the
-three Critical items (stored XSS in the admin LEA verification queue,
-hardcoded default admin credential, unauthenticated CDR/IPDR workspace
-endpoint). Nothing in that list has been fixed yet as of 2026-08-09.
+Follow up on the "Known Issues / Security Debt" list below. As of 2026-08-10,
+two of the three original Critical items are fixed and shipped: the stored
+XSS in the admin LEA verification queue, and the unauthenticated CDR/IPDR
+workspace endpoint (both now require `@admin_required`). Only the hardcoded
+default admin credential remains open, and it's intentionally deferred (see
+Decision below), not forgotten.
+
+**Decision (2026-08-10):** the hardcoded default admin credential item is
+intentionally deferred, not skipped. It will be fixed together with RBAC
+enforcement (the `role_required(*roles)` High item) as one pass, done right
+before deployment rather than now — forcing rotation/seed removal ahead of
+having roles enforced would just mean redoing the admin-bootstrap flow twice.
 
 ## Known Issues / Security Debt (pre-existing, not yet patched)
 
 Found during a full-codebase security sweep (2026-08-09), after Day 1 (§3.1
 mobile_lookup credit/audit) and the auth review were already fixed. Nothing
-below overlaps with the credit-race, `/api/me` IDOR, `/dashboard` guard, or
-login-enumeration fixes already shipped — those are done.
+below overlaps with the credit-race, `/api/me` IDOR, `/dashboard` guard,
+login-enumeration, stored-XSS-in-verification-queue, or CDR/IPDR-workspace-auth
+fixes already shipped — those are done.
 
 ### Critical
 
-- **Unauthenticated stored XSS → admin account takeover**
-  (`templates/admin.html`, `loadVerification()`, the LEA verification queue
-  renderer). It builds HTML via `innerHTML` from `full_name`, `department`,
-  `designation`, `official_email`, `unit`, `jurisdiction` **without** the
-  `esc()` helper the rest of the file uses consistently. Those fields come
-  straight from the *public, unauthenticated* `/api/lea/register` form — so
-  anyone can submit an application with a script payload as their name, and
-  it fires in the admin's session the moment they open Admin → Verification.
-  Fix: run every interpolated field through `esc()` in that function, same as
-  the rest of admin.html already does.
 - **Hardcoded default admin credential, no forced rotation**
   (`db_setup.sql`, `INSERT INTO admin_users ... ('admin', <hash of
   'admin123'>, 'super_admin')`). Runs on every fresh setup; only a comment
   says "CHANGE IMMEDIATELY," nothing enforces it. Fix: force a password
   change on first login for this seeded account, or drop the seed and
-  require an explicit admin-creation step during deploy.
-- **Broken access control on CDR/IPDR data** — `/api/analysis/workspace/
-  <batch_id>` (`app.py`, `analysis_workspace_v2`) and its page route
-  `/workspace/<batch_id>` (`workspace_page`) have **no auth check at all**,
-  unlike every other data-bearing route in the file. Anyone unauthenticated
-  can pull full CDR/IPDR call graphs (numbers, contact pairs, timestamps,
-  tower/location data) for any batch by guessing a sequential integer ID.
-  Fix: add `@admin_required` (or `@user_required` if analysts should see
-  their own batches) to both routes.
+  require an explicit admin-creation step during deploy. **Deferred** —
+  see Decision above; will be fixed together with RBAC enforcement.
 
 ### High
 
