@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>SENTINEL — Pricing</title>
+<style>
+:root{--bg:#050910;--surface:#0a111b;--panel:#0e1a29;--border:#18314f;--cyan:#00d2ff;--green:#37ff97;--red:#ff4f73;--amber:#ffbf38;--text:#e5f4ff;--muted:#7696b6;--mono:Consolas,monospace;--sans:Inter,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:22px;background:radial-gradient(circle at 50% -20%,rgba(0,210,255,.18),transparent 34%),var(--bg);color:var(--text);font-family:var(--sans)}body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,210,255,.015) 3px,rgba(0,210,255,.015) 4px)}.wrap{width:min(1080px,100%);margin:0 auto;position:relative;z-index:1}
+nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:34px}.brand{font-family:var(--mono);letter-spacing:7px;color:var(--cyan);font-size:20px;text-shadow:0 0 24px rgba(0,210,255,.5);text-decoration:none}nav .links{display:flex;gap:16px;align-items:center}nav a{color:var(--muted);text-decoration:none;font-size:13px}nav a:hover{color:var(--cyan)}
+h1{text-align:center;font-family:var(--mono);letter-spacing:4px;font-size:26px;margin:0 0 8px}.sub{text-align:center;color:var(--muted);font-size:13px;line-height:1.7;max-width:640px;margin:0 auto 12px}
+.gate{border:1px solid rgba(255,191,56,.3);background:rgba(255,191,56,.07);color:var(--amber);border-radius:14px;padding:14px;font-size:13px;line-height:1.6;margin:0 auto 26px;max-width:760px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-bottom:30px}
+.plan{border:1px solid var(--border);background:rgba(10,17,27,.95);border-radius:18px;padding:22px;display:flex;flex-direction:column;box-shadow:0 20px 80px rgba(0,0,0,.45);position:relative}
+.plan.featured{border-color:var(--cyan);box-shadow:0 0 0 1px rgba(0,210,255,.25),0 20px 80px rgba(0,0,0,.45)}
+.tag{position:absolute;top:-10px;left:22px;background:linear-gradient(135deg,#006da7,#06456b);border:1px solid var(--cyan);border-radius:20px;padding:3px 11px;font-family:var(--mono);font-size:9px;letter-spacing:2px}
+.pname{font-family:var(--mono);letter-spacing:3px;color:var(--cyan);font-size:13px}
+.price{font-size:34px;font-weight:600;margin:12px 0 2px}.price small{font-size:14px;color:var(--muted);font-weight:400}
+.per{color:var(--muted);font-size:11px;font-family:var(--mono)}
+.credits{margin:16px 0;padding:12px;border:1px solid var(--border);border-radius:10px;text-align:center;background:rgba(14,26,41,.45)}
+.credits b{color:var(--green);font-size:22px;font-family:var(--mono)}.credits span{display:block;color:var(--muted);font-size:11px;margin-top:3px}
+.pdesc{color:var(--muted);font-size:12px;line-height:1.6;flex:1}
+.btn{width:100%;margin-top:16px;border:1px solid var(--cyan);background:linear-gradient(135deg,#006da7,#06456b);color:white;border-radius:12px;padding:12px;font-family:var(--mono);letter-spacing:2px;cursor:pointer;font-size:12px}
+.btn[disabled]{opacity:.55;cursor:default}
+.note{border:1px solid var(--border);background:rgba(10,17,27,.7);border-radius:14px;padding:18px;color:var(--muted);font-size:12px;line-height:1.7}
+.note b{color:var(--text)}
+.msg{display:none;border-radius:12px;padding:14px;font-size:13px;line-height:1.6;margin-bottom:18px}.msg.show{display:block}
+.msg.ok{border:1px solid rgba(55,255,151,.35);background:rgba(55,255,151,.08);color:var(--green)}
+.msg.bad{border:1px solid rgba(255,79,115,.35);background:rgba(255,79,115,.08);color:var(--red)}
+.empty{text-align:center;color:var(--muted);padding:40px;font-size:13px}
+@media(max-width:650px){nav{flex-direction:column;gap:12px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="/">SENTINEL</a>
+    <div class="links"><a href="/">Home</a><a href="/pricing">Pricing</a><a href="/dashboard">Dashboard</a><a href="/login">Sign in</a><a href="/register">Create account</a></div>
+  </nav>
+  <h1>CREDIT PLANS</h1>
+  <p class="sub">Lookups are billed in credits. Buy a bundle, spend it as you search — nothing recurring, nothing expires.</p>
+  <div class="gate">🔒 <b>Credits are not access.</b> Every lookup also requires an approved LEA verification against your government ID. Purchasing a plan tops up your balance; it does not grant clearance.</div>
+  <div class="msg" id="msg"></div>
+  <div class="grid" id="grid"><div class="empty">Loading plans…</div></div>
+  <div class="note" id="providerNote"></div>
+</div>
+<script>
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+const grid=document.getElementById('grid'),msg=document.getElementById('msg'),note=document.getElementById('providerNote');
+let signedIn=false;
+
+function say(text,ok){msg.textContent=text;msg.className='msg show '+(ok?'ok':'bad');window.scrollTo({top:0,behavior:'smooth'})}
+
+async function loadSession(){
+  try{const r=await fetch('/api/user/session');signedIn=r.ok}catch(_){signedIn=false}
+}
+
+async function loadPlans(){
+  await loadSession();
+  try{
+    const r=await fetch('/api/plans');const d=await r.json();
+    const plans=d.plans||[];
+    if(!plans.length){grid.innerHTML='<div class="empty">No plans are published yet. Contact the administrator.</div>';return}
+    grid.innerHTML=plans.map(p=>`
+      <div class="plan${p.is_featured?' featured':''}">
+        ${p.is_featured?'<div class="tag">POPULAR</div>':''}
+        <div class="pname">${esc(p.name)}</div>
+        <div class="price">₹${esc(p.price_inr)}<small> one-time</small></div>
+        <div class="per">₹${esc(p.per_credit)} per credit</div>
+        <div class="credits"><b>${esc(p.credits)}</b><span>CREDITS</span></div>
+        <div class="pdesc">${esc(p.description)}</div>
+        <button class="btn" data-plan="${esc(p.id)}" data-name="${esc(p.name)}">▶ ${signedIn?'BUY CREDITS':'SIGN IN TO BUY'}</button>
+      </div>`).join('');
+    grid.querySelectorAll('button[data-plan]').forEach(b=>b.addEventListener('click',()=>buy(b)));
+    note.innerHTML=d.provider==='manual'
+      ? '<b>How payment works right now:</b> selecting a plan places an order and notifies the administrator. Transfer the amount using the details they provide, quoting your order reference. Your credits are added as soon as the payment is confirmed. An online payment gateway is being onboarded and will replace this step.'
+      : '<b>Secure checkout.</b> You will be redirected to the payment gateway. Credits are added automatically once payment is captured.';
+  }catch(_){grid.innerHTML='<div class="empty">Could not load plans. Please try again.</div>'}
+}
+
+async function buy(btn){
+  if(!signedIn){window.location.href='/register';return}
+  const original=btn.textContent;btn.disabled=true;btn.textContent='PLACING ORDER…';
+  try{
+    const r=await fetch('/api/payments/checkout',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({plan_id:Number(btn.dataset.plan)})});
+    const d=await r.json();
+    if(!r.ok){say(d.error||'Could not place the order.',false);btn.disabled=false;btn.textContent=original;return}
+    if(d.checkout){
+      // A live gateway returned a checkout payload — hand off to its SDK here.
+      say('Redirecting to secure checkout for order '+d.order_ref+'…',true);
+      return;
+    }
+    say('Order '+d.order_ref+' placed for '+btn.dataset.name+'. '+(d.instructions||''),true);
+    btn.textContent='ORDER PLACED';
+  }catch(_){say('Network error. Please try again.',false);btn.disabled=false;btn.textContent=original}
+}
+loadPlans();
+</script>
+</body>
+</html>

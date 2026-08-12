@@ -52,6 +52,7 @@ body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repe
       <button class="btn" onclick="openProfile()">👤 Profile</button>
     </header>
     <section class="workspace">
+      <div id="gateBanner" style="display:none"></div>
       <div class="stats" id="stats"></div>
       <div class="tabbar">
         <div class="tab active" onclick="openTab('osint',this)">OSINT Lookup</div>
@@ -136,27 +137,89 @@ const fallbackCommands=['Analyze this CDR','Find common contacts','Show suspect 
 let catalog={osint_tools:fallbackOsint,analyzer_tools:fallbackAnalyzer,ai_commands:fallbackCommands};
 function accentFor(i){return ['var(--cyan)','var(--purple)','var(--green)','var(--amber)','var(--red)'][i%5]}
 function tile(t,i){return `<div class="tile" style="--accent:${accentFor(i)};${t.status==='inactive'?'opacity:.55':''}" onclick="openTool('${t.code}','${t.name.replace(/'/g,'\\\'')}','${t.icon}',${t.credits||0},'${t.status||'active'}')"><div class="icon">${t.icon}</div><div class="name">${t.name}</div><div class="desc">${t.description||''}</div><div class="meta"><span class="badge ${t.status==='inactive'?'off':''}">${(t.status||'active').toUpperCase()}</span><span class="credits">${t.credits||t.credits_per_use||0} credits</span></div></div>`}
-function renderTiles(){osintTiles.innerHTML=catalog.osint_tools.map(tile).join('');analyzerTiles.innerHTML=catalog.analyzer_tools.map(tile).join('');aiCommands.innerHTML=catalog.ai_commands.map(c=>`<button class="btn" style="display:block;width:100%;margin-bottom:8px;text-align:left" onclick="aiText.value='${c.replace(/'/g,'\\\'')}';sendAI()">${c}</button>`).join('')}
+function renderTiles(){osintTiles.innerHTML=catalog.osint_tools.map(tile).join('');analyzerTiles.innerHTML=catalog.analyzer_tools.map(tile).join('');aiCommands.innerHTML=catalog.ai_commands.map(c=>`<button class="btn" style="display:block;width:100%;margin-bottom:8px;text-align:left" onclick="aiText.value='${esc(c).replace(/'/g,'\\\'')}';sendAI()">${esc(c)}</button>`).join('')}
 function openTab(id,el){document.querySelectorAll('.content').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab,.nav-item').forEach(x=>x.classList.remove('active'));document.getElementById('tab-'+id).classList.add('active');if(el)el.classList.add('active');if(id==='hub')setTimeout(drawGraph,50);if(id==='cases')loadDashboardCases();sidebar.classList.remove('open')}
-function openTool(code,name,icon,credits,status){toolModal.classList.add('show');modalTitle.textContent=`${icon} ${name}`;if(status==='inactive'){modalBody.innerHTML=`<div style="color:var(--red)">This service is disabled by admin.</div>`;return;}if(code==='cdr_analysis'||code==='cdr_processor'||code==='ipdr_analysis'){const type=code.includes('ipdr')?'IPDR':'CDR';modalBody.innerHTML=`<div class="muted" style="font-size:13px;margin-bottom:14px">Upload lawful ${type} CSV evidence for analysis. This module analyzes your uploaded file only.</div><div class="field"><label>CASE REFERENCE</label><input id="caseRef" placeholder="e.g. FIR-2026-1182"></div><div class="field"><label>${type} CSV FILE</label><input type="file" id="toolFile" accept=".csv"></div><button class="btn" onclick="runFileTool('${type.toLowerCase()}')">▶ Run ${type} Analysis — ${credits} credits</button><div id="toolResult" class="muted" style="margin-top:12px;font-size:12px"></div>`}else{modalBody.innerHTML=`<div class="muted" style="font-size:13px;line-height:1.6;margin-bottom:12px">Enter query for ${name}. This will call configured backend connector/API. If no API is configured, backend will return exact error.</div><div class="field"><label>QUERY</label><input id="genericToolQuery" placeholder="Enter target/query"></div><button class="btn" onclick="runGenericTool('${code}')">Run ${name} — ${credits} credits</button><div id="toolResult" class="muted" style="margin-top:12px;font-size:12px"></div>`}}
+function openTool(code,name,icon,credits,status){toolModal.classList.add('show');modalTitle.textContent=`${esc(icon)} ${esc(name)}`;if(status==='inactive'){modalBody.innerHTML=`<div style="color:var(--red)">This service is disabled by admin.</div>`;return;}if(code==='cdr_analysis'||code==='cdr_processor'||code==='ipdr_analysis'){const type=code.includes('ipdr')?'IPDR':'CDR';modalBody.innerHTML=`<div class="muted" style="font-size:13px;margin-bottom:14px">Upload lawful ${esc(type)} CSV evidence for analysis. This module analyzes your uploaded file only.</div><div class="field"><label>CASE REFERENCE</label><input id="caseRef" placeholder="e.g. FIR-2026-1182"></div><div class="field"><label>${esc(type)} CSV FILE</label><input type="file" id="toolFile" accept=".csv"></div><button class="btn" onclick="runFileTool('${esc(type.toLowerCase())}')">▶ Run ${esc(type)} Analysis — ${esc(credits)} credits</button><div id="toolResult" class="muted" style="margin-top:12px;font-size:12px"></div>`}else{modalBody.innerHTML=`<div class="muted" style="font-size:13px;line-height:1.6;margin-bottom:12px">Enter query for ${esc(name)}. This will call configured backend connector/API. If no API is configured, backend will return exact error.</div><div class="field"><label>QUERY</label><input id="genericToolQuery" placeholder="Enter target/query"></div><button class="btn" onclick="runGenericTool('${esc(code)}')">Run ${esc(name)} — ${esc(credits)} credits</button><div id="toolResult" class="muted" style="margin-top:12px;font-size:12px"></div>`}}
 async function runFileTool(type){if(!toolFile.files.length){toolResult.innerHTML='<span style="color:var(--red)">Choose a CSV file first.</span>';return}toolResult.textContent='Analyzing...';const fd=new FormData();fd.append('file',toolFile.files[0]);fd.append('case_reference',caseRef.value);const ep=type==='cdr'?'/api/tools/cdr/analyze':'/api/tools/ipdr/analyze';try{const r=await fetch(ep,{method:'POST',body:fd});const d=await r.json();if(!r.ok){toolResult.innerHTML='<span style="color:var(--red)">'+(d.error||'Failed')+'</span>';return}toolResult.innerHTML='<span style="color:var(--green)">✓ '+d.total_records+' records processed. Unique: '+(d.unique_numbers||d.unique_subscribers||0)+'</span>';toastMsg('Analysis complete');}catch(e){toolResult.innerHTML='<span style="color:var(--red)">Backend not reachable.</span>'}}
 async function sendAI(){const v=aiText.value.trim();if(!v)return;messages.insertAdjacentHTML('beforeend',`<div class="msg usermsg">${escapeHtml(v)}</div>`);aiText.value='';messages.insertAdjacentHTML('beforeend',`<div class="msg botmsg" id="aiThinking">Thinking...</div>`);messages.scrollTop=messages.scrollHeight;try{const r=await fetch('/api/ai/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:v})});const d=await r.json();document.getElementById('aiThinking').remove();if(r.ok){messages.insertAdjacentHTML('beforeend',`<div class="msg botmsg">${escapeHtml(d.answer||'No answer')}</div>`)}else{messages.insertAdjacentHTML('beforeend',`<div class="msg botmsg" style="border-color:rgba(255,79,115,.45);color:var(--red)">${escapeHtml(d.error||'AI error')}</div>`)}}catch(e){document.getElementById('aiThinking')?.remove();messages.insertAdjacentHTML('beforeend',`<div class="msg botmsg" style="color:var(--red)">AI backend/network error.</div>`)}messages.scrollTop=messages.scrollHeight}
-function escapeHtml(s){return s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}function escapeHtml(s){return esc(s)}
 function toastMsg(m,type){toast.textContent=m;toast.style.display='block';toast.style.borderColor=type==='error'?'var(--red)':'var(--green)';toast.style.color=type==='error'?'var(--red)':'var(--green)';clearTimeout(window.tto);window.tto=setTimeout(()=>toast.style.display='none',2800)}
 
-async function runGenericTool(code){const q=document.getElementById('genericToolQuery').value.trim();if(!q){toolResult.innerHTML='<span style="color:var(--red)">Enter query first.</span>';return}toolResult.textContent='Running...';try{const r=await fetch('/api/tools/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,query:q})});const d=await r.json();if(r.ok&&d.success){toolResult.innerHTML='<pre style="white-space:pre-wrap;color:var(--green)">'+escapeHtml(JSON.stringify(d,null,2))+'</pre>'}else{toolResult.innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||d.message||'Tool failed')+'</span>'}}catch(e){toolResult.innerHTML='<span style="color:var(--red)">Backend/network error.</span>'}}
-async function openProfile(){profileModal.classList.add('show');profileBody.innerHTML='<div class="muted">Loading...</div>';try{const r=await fetch('/api/user/profile');const d=await r.json();if(!r.ok){profileBody.innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||'Login required')+'</span>';return}const u=d.user;profileBody.innerHTML=`<div class="mini-row"><span>Name</span><b>${escapeHtml(u.name||'')}</b></div><div class="mini-row"><span>Phone</span><b>${escapeHtml(u.phone||'')}</b></div><div class="mini-row"><span>Email</span><b>${escapeHtml(u.official_email||'Not set')}</b></div><div class="mini-row"><span>Department</span><b>${escapeHtml(u.department||'')}</b></div><div class="mini-row"><span>Credits</span><b>${u.credits}</b></div><div class="mini-row"><span>2FA</span><b style="color:${u.twofa_enabled?'var(--green)':'var(--red)'}">${u.twofa_enabled?'Enabled':'Not Enabled'}</b></div>${!u.twofa_enabled?'<div style="border:1px solid rgba(255,79,115,.45);background:rgba(255,79,115,.08);color:var(--red);border-radius:12px;padding:10px;margin:12px 0">2FA is mandatory. Please configure Google Authenticator. Repeated non-compliance may lead to account block.</div>':''}<h4 style="color:var(--cyan);font-family:var(--mono)">Change Password</h4><div class="field"><label>Current Password</label><input id="curPass" type="password"></div><div class="field"><label>New Password</label><input id="newPass" type="password"></div><button class="btn" onclick="changePassword()">Change Password</button><h4 style="color:var(--cyan);font-family:var(--mono)">2FA Configuration</h4><button class="btn" onclick="setupUser2FA()">Generate 2FA QR</button><div id="userQrBox" style="margin-top:10px"></div><div class="field"><label>OTP</label><input id="user2faOtp"></div><button class="btn" onclick="enableUser2FA()">Enable 2FA</button>`}catch(e){profileBody.innerHTML='<span style="color:var(--red)">Profile backend error.</span>'}}
+function prettyLabel(k){return esc(String(k).replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase()))}
+
+/* Render a result as labelled rows rather than a raw JSON dump. Falls back to
+   formatted JSON for shapes we do not recognise, so nothing is ever hidden. */
+function resultCard(block){
+  const rows=[];
+  const data=block.data;
+  const emit=obj=>{
+    Object.keys(obj).forEach(k=>{
+      if(k==='id'||obj[k]===null||obj[k]===''||obj[k]===undefined)return;
+      const v=obj[k];
+      if(typeof v==='object'){rows.push(`<div class="mini-row"><span>${prettyLabel(k)}</span><b>${esc(JSON.stringify(v))}</b></div>`)}
+      else{rows.push(`<div class="mini-row"><span>${prettyLabel(k)}</span><b>${esc(v)}</b></div>`)}
+    });
+  };
+  if(Array.isArray(data)){data.forEach(d=>emit(d.data&&typeof d.data==='object'?d.data:d))}
+  else if(data&&typeof data==='object'){emit(data)}
+  else{return `<pre style="white-space:pre-wrap;color:var(--green)">${esc(JSON.stringify(data,null,2))}</pre>`}
+  return `<div style="border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:12px">
+      <div style="font-family:var(--mono);font-size:11px;letter-spacing:2px;color:var(--cyan);margin-bottom:10px">▸ ${esc(block.source||'RESULT')}</div>
+      ${rows.join('')||'<span class="muted">No fields returned.</span>'}
+    </div>`;
+}
+
+async function runGenericTool(code){
+  const q=document.getElementById('genericToolQuery').value.trim();
+  if(!q){toolResult.innerHTML='<span style="color:var(--red)">Enter query first.</span>';return}
+  const caseEl=document.getElementById('caseRef');
+  toolResult.innerHTML='<span class="muted">Running…</span>';
+  try{
+    const r=await fetch('/api/tools/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code,query:q,case_reference:caseEl?caseEl.value.trim():''})});
+    const d=await r.json();
+
+    if(r.status===402){
+      toolResult.innerHTML=`<div style="border:1px solid rgba(255,191,56,.4);background:rgba(255,191,56,.07);border-radius:14px;padding:16px">
+        <b style="color:var(--amber)">💳 Not enough credits</b>
+        <div class="mini-row"><span>Required</span><b>${esc(d.credits_required)}</b></div>
+        <div class="mini-row"><span>Available</span><b style="color:var(--red)">${esc(d.credits_available)}</b></div>
+        <div style="margin-top:12px"><a class="btn" href="/pricing" style="text-decoration:none">▶ BUY CREDITS</a></div>
+      </div>`;
+      return;
+    }
+    if(r.status===403&&d.reason&&d.reason.indexOf('verification')===0){
+      toolResult.innerHTML=`<div style="border:1px solid rgba(255,191,56,.4);background:rgba(255,191,56,.07);border-radius:14px;padding:16px">
+        <b style="color:var(--amber)">🔒 Lookups locked</b><div style="margin-top:6px">${esc(d.error)}</div>
+        ${d.verification_status==='unverified'||d.verification_status==='rejected'
+          ? '<div style="margin-top:12px"><button class="btn" onclick="openVerify()">▶ SUBMIT LEA VERIFICATION</button></div>' : ''}
+      </div>`;
+      refreshAccount();
+      return;
+    }
+    if(r.ok&&d.success){
+      const charged=(d.credits_charged!==undefined)
+        ? `<div class="muted" style="font-size:12px;margin-bottom:12px">Charged ${esc(d.credits_charged)} credit(s) · ${esc(d.credits_remaining)} remaining</div>` : '';
+      toolResult.innerHTML=charged+(d.results||[]).map(resultCard).join('')+
+        (d.errors&&d.errors.length?`<div class="muted" style="font-size:12px">${esc(d.errors.join(' · '))}</div>`:'');
+      refreshAccount();
+      return;
+    }
+    toolResult.innerHTML='<span style="color:var(--red)">'+esc(d.error||d.message||'Tool failed')+'</span>';
+  }catch(e){toolResult.innerHTML='<span style="color:var(--red)">Backend/network error.</span>'}
+}
+async function openProfile(){profileModal.classList.add('show');profileBody.innerHTML='<div class="muted">Loading...</div>';try{const r=await fetch('/api/user/profile');const d=await r.json();if(!r.ok){profileBody.innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||'Login required')+'</span>';return}const u=d.user;profileBody.innerHTML=`<div class="mini-row"><span>Name</span><b>${escapeHtml(u.name||'')}</b></div><div class="mini-row"><span>Phone</span><b>${escapeHtml(u.phone||'')}</b></div><div class="mini-row"><span>Email</span><b>${escapeHtml(u.official_email||'Not set')}</b></div><div class="mini-row"><span>Department</span><b>${escapeHtml(u.department||'')}</b></div><div class="mini-row"><span>Credits</span><b>${esc(u.credits)}</b></div><div class="mini-row"><span>2FA</span><b style="color:${u.twofa_enabled?'var(--green)':'var(--red)'}">${u.twofa_enabled?'Enabled':'Not Enabled'}</b></div>${!u.twofa_enabled?'<div style="border:1px solid rgba(255,79,115,.45);background:rgba(255,79,115,.08);color:var(--red);border-radius:12px;padding:10px;margin:12px 0">2FA is mandatory. Please configure Google Authenticator. Repeated non-compliance may lead to account block.</div>':''}<h4 style="color:var(--cyan);font-family:var(--mono)">Change Password</h4><div class="field"><label>Current Password</label><input id="curPass" type="password"></div><div class="field"><label>New Password</label><input id="newPass" type="password"></div><button class="btn" onclick="changePassword()">Change Password</button><h4 style="color:var(--cyan);font-family:var(--mono)">2FA Configuration</h4><button class="btn" onclick="setupUser2FA()">Generate 2FA QR</button><div id="userQrBox" style="margin-top:10px"></div><div class="field"><label>OTP</label><input id="user2faOtp"></div><button class="btn" onclick="enableUser2FA()">Enable 2FA</button>`}catch(e){profileBody.innerHTML='<span style="color:var(--red)">Profile backend error.</span>'}}
 async function changePassword(){const r=await fetch('/api/user/password-change',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:curPass.value,new_password:newPass.value})});const d=await r.json().catch(()=>({}));toastMsg(r.ok?'Password changed':(d.error||'Password change failed'),r.ok?'':'error')}
 async function setupUser2FA(){const r=await fetch('/api/user/2fa/setup',{method:'POST'});const d=await r.json();if(r.ok){userQrBox.innerHTML=`<img src="${d.qr_data_uri}" style="background:white;padding:8px;border-radius:8px;max-width:210px"><div class="muted">Secret: ${d.manual_secret}</div>`}else toastMsg(d.error||'2FA setup failed','error')}
 async function enableUser2FA(){const r=await fetch('/api/user/2fa/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({otp:user2faOtp.value})});const d=await r.json().catch(()=>({}));if(r.ok){toastMsg('2FA enabled');openProfile()}else toastMsg(d.error||'2FA enable failed','error')}
 async function checkMandatory2FA(){try{const r=await fetch('/api/user/profile');if(!r.ok)return;const d=await r.json();if(d.twofa_mandatory && !d.user.twofa_enabled){setTimeout(()=>{profileModal.classList.add('show');openProfile();toastMsg('2FA required. Please configure Google Authenticator.','error')},800)}}catch(e){}}
 
 async function load(){try{const r=await fetch('/api/dashboard/catalog');if(r.ok)catalog=await r.json()}catch(e){}renderTiles();loadIntel();startSecurityTimers();drawGraph();checkMandatory2FA()}
-async function loadIntel(){let d;try{const r=await fetch('/api/intelligence/summary');d=r.ok?await r.json():null}catch(e){}d=d||{stats:{active_cases:12,todays_searches:248,high_risk_hits:17,telecom_queries:96,financial_queries:54,threat_score:87},recent_searches:[{query:'+91 9876543210',type:'Mobile Lookup',time:'2 mins ago'}],watchlist_hits:[{label:'Number found in watchlist',severity:'high',detail:'Possible fraudster'}],live_feed:[{tag:'BREACH',text:'Email found in data breach',source:'Breach DB',time:'2 mins ago'}]};stats.innerHTML=[['ACTIVE CASES',d.stats.active_cases,'+2 new today','var(--cyan)'],["TODAY'S SEARCHES",d.stats.todays_searches,'+18% from yesterday','var(--green)'],['HIGH RISK HITS',d.stats.high_risk_hits,'▲ 5 new alerts','var(--red)'],['TELECOM QUERIES',d.stats.telecom_queries,'CDR / IPDR','var(--purple)'],['FINANCIAL QUERIES',d.stats.financial_queries,'Bank / UPI / Wallet','var(--amber)'],['THREAT SCORE',d.stats.threat_score+'%','High Risk','var(--amber)']].map(x=>`<div class="stat" style="--c:${x[3]}"><div class="label">${x[0]}</div><div class="value">${x[1]}</div><div class="sub">${x[2]}</div></div>`).join('');recentSearches.innerHTML=d.recent_searches.map(x=>`<div class="mini-row"><span><b>${x.query}</b><br><span class="muted">${x.type}</span></span><span class="muted">${x.time}</span></div>`).join('');watchlistHits.innerHTML=d.watchlist_hits.map(x=>`<div class="mini-row"><span><b>${x.label}</b><br><span class="muted">${x.detail}</span></span><span style="color:${x.severity==='high'?'var(--red)':'var(--amber)'}">${x.severity}</span></div>`).join('');liveFeed.innerHTML=d.live_feed.map(x=>`<div class="feed-item"><span class="feed-tag">${x.tag}</span><span>${x.text}<br><span class="muted">Source: ${x.source}</span></span><span class="muted">${x.time}</span></div>`).join('')}
+async function loadIntel(){let d;try{const r=await fetch('/api/intelligence/summary');d=r.ok?await r.json():null}catch(e){}d=d||{stats:{active_cases:12,todays_searches:248,high_risk_hits:17,telecom_queries:96,financial_queries:54,threat_score:87},recent_searches:[{query:'+91 9876543210',type:'Mobile Lookup',time:'2 mins ago'}],watchlist_hits:[{label:'Number found in watchlist',severity:'high',detail:'Possible fraudster'}],live_feed:[{tag:'BREACH',text:'Email found in data breach',source:'Breach DB',time:'2 mins ago'}]};stats.innerHTML=[['ACTIVE CASES',d.stats.active_cases,'+2 new today','var(--cyan)'],["TODAY'S SEARCHES",d.stats.todays_searches,'+18% from yesterday','var(--green)'],['HIGH RISK HITS',d.stats.high_risk_hits,'▲ 5 new alerts','var(--red)'],['TELECOM QUERIES',d.stats.telecom_queries,'CDR / IPDR','var(--purple)'],['FINANCIAL QUERIES',d.stats.financial_queries,'Bank / UPI / Wallet','var(--amber)'],['THREAT SCORE',d.stats.threat_score+'%','High Risk','var(--amber)']].map(x=>`<div class="stat" style="--c:${esc(x[3])}"><div class="label">${esc(x[0])}</div><div class="value">${esc(x[1])}</div><div class="sub">${esc(x[2])}</div></div>`).join('');recentSearches.innerHTML=d.recent_searches.map(x=>`<div class="mini-row"><span><b>${esc(x.query)}</b><br><span class="muted">${esc(x.type)}</span></span><span class="muted">${esc(x.time)}</span></div>`).join('');watchlistHits.innerHTML=d.watchlist_hits.map(x=>`<div class="mini-row"><span><b>${esc(x.label)}</b><br><span class="muted">${esc(x.detail)}</span></span><span style="color:${x.severity==='high'?'var(--red)':'var(--amber)'}">${esc(x.severity)}</span></div>`).join('');liveFeed.innerHTML=d.live_feed.map(x=>`<div class="feed-item"><span class="feed-tag">${esc(x.tag)}</span><span>${esc(x.text)}<br><span class="muted">Source: ${esc(x.source)}</span></span><span class="muted">${esc(x.time)}</span></div>`).join('')}
 function drawGraph(){const c=document.getElementById('linkGraph');if(!c)return;const r=c.getBoundingClientRect();c.width=r.width;c.height=r.height;const ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);const cx=c.width/2,cy=c.height/2;const nodes=[['📱',cx,cy,'var(--cyan)'],['👤',cx-150,cy-70,'var(--purple)'],['✉️',cx+150,cy-65,'var(--cyan)'],['🌐',cx-130,cy+85,'var(--green)'],['🚗',cx+130,cy+85,'var(--red)'],['🏦',cx,cy+115,'var(--amber)'],['⚠️',cx,cy-120,'var(--purple)']];ctx.strokeStyle='rgba(0,210,255,.28)';ctx.lineWidth=1.5;nodes.slice(1).forEach(n=>{ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(n[1],n[2]);ctx.stroke()});nodes.forEach(n=>{ctx.beginPath();ctx.arc(n[1],n[2],24,0,Math.PI*2);ctx.fillStyle='#091522';ctx.fill();ctx.strokeStyle=n[3].replace('var(--cyan)','#00d2ff').replace('var(--purple)','#a46bff').replace('var(--green)','#37ff97').replace('var(--red)','#ff4f73').replace('var(--amber)','#ffbf38');ctx.stroke();ctx.font='20px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(n[0],n[1],n[2])})}
 let sessionRemaining=3600,inactivityLimit=900,inactivityRemaining=900;async function startSecurityTimers(){try{const r=await fetch('/api/admin/session-info');if(r.ok){const d=await r.json();sessionRemaining=d.session_remaining_seconds;inactivityLimit=d.inactivity_timeout_seconds;inactivityRemaining=inactivityLimit}}catch(e){}['mousemove','keydown','click','scroll','touchstart'].forEach(ev=>document.addEventListener(ev,()=>inactivityRemaining=inactivityLimit,{passive:true}));setInterval(()=>{sessionRemaining--;inactivityRemaining--;const rem=Math.max(0,Math.min(sessionRemaining,inactivityRemaining));sessionCountdown.textContent=String(Math.floor(rem/60)).padStart(2,'0')+':'+String(rem%60).padStart(2,'0');if(rem<=0){toastMsg('Session expired due to timeout');setTimeout(()=>location.href='/',700)}},1000)}
 
-async function loadDashboardCases(){const box=document.getElementById('dashCasesList'); if(!box) return; box.innerHTML='<div class="muted">Loading...</div>'; try{const r=await fetch('/api/cases'); const rows=await r.json(); if(!rows.length){box.innerHTML='<div class="muted">No cases yet. Create one from the left panel.</div>'; return;} box.innerHTML=rows.map(c=>`<div class="case-action" style="align-items:flex-start"><div class="ico">📁</div><div style="flex:1"><b>${escapeHtml(c.case_reference)} — ${escapeHtml(c.title)}</b><div class="muted">${escapeHtml(c.status)} · ${escapeHtml(c.priority)} · ${c.updated_at||''}</div><div style="margin-top:8px"><button class="btn" onclick="addDashboardNote(${c.id})">Add Note</button> <button class="btn" onclick="window.open('/api/cases/${c.id}/report','_blank')">Report</button></div></div></div>`).join('');}catch(e){box.innerHTML='<span style="color:var(--red)">Case API not reachable.</span>'}}
+async function loadDashboardCases(){const box=document.getElementById('dashCasesList'); if(!box) return; box.innerHTML='<div class="muted">Loading...</div>'; try{const r=await fetch('/api/cases'); const rows=await r.json(); if(!rows.length){box.innerHTML='<div class="muted">No cases yet. Create one from the left panel.</div>'; return;} box.innerHTML=rows.map(c=>`<div class="case-action" style="align-items:flex-start"><div class="ico">📁</div><div style="flex:1"><b>${escapeHtml(c.case_reference)} — ${escapeHtml(c.title)}</b><div class="muted">${escapeHtml(c.status)} · ${escapeHtml(c.priority)} · ${esc(c.updated_at||'')}</div><div style="margin-top:8px"><button class="btn" onclick="addDashboardNote(${c.id})">Add Note</button> <button class="btn" onclick="window.open('/api/cases/${c.id}/report','_blank')">Report</button></div></div></div>`).join('');}catch(e){box.innerHTML='<span style="color:var(--red)">Case API not reachable.</span>'}}
 async function createDashboardCase(){const title=document.getElementById('dashCaseTitle').value.trim(); if(!title){toastMsg('Enter case title','error'); return;} const body={title,case_reference:document.getElementById('dashCaseRef').value.trim(),summary:document.getElementById('dashCaseSummary').value.trim(),priority:'medium'}; const r=await fetch('/api/cases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); toastMsg(r.ok?'Case created':'Case creation failed',r.ok?'':'error'); if(r.ok){dashCaseTitle.value='';dashCaseRef.value='';dashCaseSummary.value='';loadDashboardCases();}}
 async function addDashboardNote(id){const note=prompt('Investigation note'); if(!note) return; const r=await fetch(`/api/cases/${id}/notes`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({note})}); toastMsg(r.ok?'Note added':'Note failed',r.ok?'':'error');}
 
@@ -164,6 +227,102 @@ async function addDashboardNote(id){const note=prompt('Investigation note'); if(
 try{const es=new EventSource('/api/events');es.onmessage=()=>{loadIntel();fetch('/api/dashboard/catalog').then(r=>r.ok?r.json():catalog).then(c=>{catalog=c;renderTiles()}).catch(()=>{})};}catch(e){}
 
 window.addEventListener('resize',drawGraph);load();
+
+/* ─────────────────────────────────────────────
+   ACCOUNT GATE
+   Credits and clearance are read from the server on every refresh — the header
+   credit count used to be a hardcoded 248 that no code ever assigned to.
+   ───────────────────────────────────────────── */
+let ACCOUNT=null;
+
+function gateHtml(u){
+  const box=(colour,bg,body)=>`<div style="border:1px solid ${colour};background:${bg};border-radius:14px;padding:14px 16px;margin-bottom:16px;font-size:13px;line-height:1.65">${body}</div>`;
+  if(u.verification_status==='unverified'){
+    return box('rgba(255,191,56,.35)','rgba(255,191,56,.07)',
+      `<b style="color:var(--amber)">🔒 Lookups are locked.</b> ${esc(u.gate_message)}
+       <div style="margin-top:10px"><button class="btn" onclick="openVerify()">▶ SUBMIT LEA VERIFICATION</button>
+       <a class="btn" href="/pricing" style="margin-left:8px;text-decoration:none">💳 VIEW PRICING</a></div>`);
+  }
+  if(u.verification_status==='pending'){
+    return box('rgba(0,210,255,.35)','rgba(0,210,255,.07)',
+      `<b style="color:var(--cyan)">⏳ Verification under review.</b> ${esc(u.gate_message)}`);
+  }
+  if(u.verification_status==='rejected'){
+    return box('rgba(255,79,115,.35)','rgba(255,79,115,.08)',
+      `<b style="color:var(--red)">⛔ Verification rejected.</b> ${esc(u.gate_message)}
+       <div style="margin-top:10px"><button class="btn" onclick="openVerify()">▶ RESUBMIT VERIFICATION</button></div>`);
+  }
+  if(!u.credits){
+    return box('rgba(255,191,56,.35)','rgba(255,191,56,.07)',
+      `<b style="color:var(--amber)">💳 You have no credits.</b> Lookups are billed per search.
+       <div style="margin-top:10px"><a class="btn" href="/pricing" style="text-decoration:none">▶ BUY CREDITS</a></div>`);
+  }
+  return '';
+}
+
+async function refreshAccount(){
+  try{
+    const r=await fetch('/api/user/session');
+    if(!r.ok){return}
+    const d=await r.json();
+    ACCOUNT=d.user;
+    const bal=document.getElementById('creditBalance');
+    if(bal){bal.textContent=ACCOUNT.credits}
+    const banner=document.getElementById('gateBanner');
+    if(banner){const h=gateHtml(ACCOUNT);banner.innerHTML=h;banner.style.display=h?'block':'none'}
+  }catch(_){}
+}
+
+/* ── LEA verification submission ── */
+const VERIFY_DEPARTMENTS=['State Police','Cyber Crime Cell','CBI','NIA','Enforcement Directorate (ED)','Income Tax Department','Narcotics Control Bureau','Intelligence Bureau','Other'];
+
+function openVerify(){
+  toolModal.classList.add('show');
+  modalTitle.textContent='🛡️ LEA VERIFICATION';
+  modalBody.innerHTML=`
+    <div class="muted" style="font-size:13px;margin-bottom:14px">Your government ID and department ID card are encrypted at rest and reviewed manually. Lookups unlock once approved.</div>
+    <form id="verifyForm" enctype="multipart/form-data">
+      <div class="field"><label>DEPARTMENT / AGENCY</label>
+        <select name="department" required>${['<option value="">Select</option>'].concat(VERIFY_DEPARTMENTS.map(d=>`<option>${esc(d)}</option>`)).join('')}</select></div>
+      <div class="field"><label>DESIGNATION / RANK</label><input name="designation" required placeholder="Inspector / SI / ASI"></div>
+      <div class="field"><label>SERVICE / BADGE ID</label><input name="service_id" required></div>
+      <div class="field"><label>POLICE STATION / UNIT</label><input name="unit" required></div>
+      <div class="field"><label>STATE / JURISDICTION</label><input name="jurisdiction" required></div>
+      <div class="field"><label>GOVERNMENT ID PROOF</label><input type="file" name="gov_id" accept="image/*,application/pdf" required></div>
+      <div class="field"><label>DEPARTMENT ID CARD</label><input type="file" name="dept_id" accept="image/*,application/pdf" required></div>
+      <div class="field"><label>ADDITIONAL NOTES</label><textarea name="notes" rows="2"></textarea></div>
+      <button class="btn" id="verifyBtn">▶ SUBMIT FOR VERIFICATION</button>
+    </form>
+    <div id="verifyMsg" style="margin-top:12px;font-size:13px"></div>`;
+  document.getElementById('verifyForm').addEventListener('submit',submitVerify);
+}
+
+async function submitVerify(e){
+  e.preventDefault();
+  const form=e.target,btn=document.getElementById('verifyBtn'),out=document.getElementById('verifyMsg');
+  for(const f of form.querySelectorAll('input[type=file]')){
+    if(f.files[0]&&f.files[0].size>5*1024*1024){out.innerHTML='<span style="color:var(--red)">Each file must be under 5MB.</span>';return}
+  }
+  btn.disabled=true;btn.textContent='SUBMITTING…';out.textContent='';
+  try{
+    const r=await fetch('/api/lea/register',{method:'POST',body:new FormData(form)});
+    const d=await r.json();
+    if(r.ok){
+      form.style.display='none';
+      out.innerHTML=`<span style="color:var(--green)">✅ Submitted as ${esc(d.application_id)}. You will be notified after review.</span>`;
+      refreshAccount();
+    }else{
+      out.innerHTML='<span style="color:var(--red)">'+esc(d.error||'Submission failed')+'</span>';
+      btn.disabled=false;btn.textContent='▶ SUBMIT FOR VERIFICATION';
+    }
+  }catch(_){
+    out.innerHTML='<span style="color:var(--red)">Network error. Please try again.</span>';
+    btn.disabled=false;btn.textContent='▶ SUBMIT FOR VERIFICATION';
+  }
+}
+
+refreshAccount();
+setInterval(refreshAccount,60000);
 </script>
 </body>
 </html>

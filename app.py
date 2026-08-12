@@ -14,10 +14,13 @@ import base64
 import collections
 import contextlib
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import threading
@@ -46,6 +49,7 @@ from flask import (
     send_from_directory,
     session,
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -54,6 +58,21 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "dev_secret_change_this")
 app.permanent_session_lifetime = timedelta(minutes=int(os.getenv("SESSION_TIMEOUT_MIN", "60")))
+
+# X-Forwarded-For is client-supplied and must never be trusted blindly — an attacker
+# who can set it defeats the login rate limit, the lockout counter and the IP recorded
+# in activity_log. Only honour as many hops as we actually run behind.
+# TRUSTED_PROXY_COUNT=0 means "no proxy": remote_addr is used and the header ignored.
+TRUSTED_PROXY_COUNT = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
+if TRUSTED_PROXY_COUNT > 0:
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=TRUSTED_PROXY_COUNT,
+        x_proto=TRUSTED_PROXY_COUNT,
+        x_host=TRUSTED_PROXY_COUNT,
+        x_port=0,
+        x_prefix=0,
+    )
 
 BASE_DIR = os.path.dirname(__file__)
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
@@ -221,6 +240,173 @@ def role_required(*roles):
     return decorator
 
 
+# ─────────────────────────────────────────────
+# ACCOUNT STATE vs DATA CLEARANCE
+#
+# These are two orthogonal facts and are deliberately kept in two columns:
+#   bot_users.status              — can this account sign in at all
+#   bot_users.verification_status — has this operator been cleared to query
+#                                   subscriber data (the LEA gov-ID review)
+#
+# Anyone may sign up and sign in. Signing in buys you the dashboard, your profile
+# and the pricing page — nothing else. Every route that returns real subscriber
+# data must be behind @verified_required, and paying for credits does not grant
+# clearance: money buys credits, the gov-ID review buys access.
+# ─────────────────────────────────────────────
+LOGIN_BLOCKED_STATUSES = {"blocked", "rejected", "inactive"}
+
+
+def load_current_user(cursor=None):
+    """Fetch the signed-in user's live row. Never trust session for authorization
+    state — status and clearance can be revoked mid-session by an admin."""
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+
+    def _fetch(cur):
+        cur.execute(
+            """
+            SELECT id, phone, name, department, official_email, credits, status,
+                   verification_status, twofa_enabled
+            FROM bot_users WHERE id=%s LIMIT 1
+            """,
+            (user_id,),
+        )
+        return cur.fetchone()
+
+    if cursor is not None:
+        return _fetch(cursor)
+    with db_conn() as conn:
+        return _fetch(conn.cursor(dictionary=True))
+
+
+def verified_required(f):
+    """Require an authenticated user who has passed LEA verification.
+
+    Returns 403 with a machine-readable `reason` so the dashboard can render the
+    right call to action (finish signup vs. awaiting review vs. rejected) instead
+    of a flat error string.
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("is_user"):
+            return jsonify({"error": "Authentication required"}), 401
+        user = load_current_user()
+        if not user:
+            session.clear()
+            return jsonify({"error": "Authentication required"}), 401
+        if user.get("status") in LOGIN_BLOCKED_STATUSES:
+            session.clear()
+            return jsonify({"error": f"Account is {user.get('status')}.", "reason": "account_blocked"}), 403
+        state = user.get("verification_status") or "unverified"
+        if state != "approved":
+            return jsonify({
+                "error": VERIFICATION_MESSAGES.get(state, VERIFICATION_MESSAGES["unverified"]),
+                "reason": f"verification_{state}",
+                "verification_status": state,
+            }), 403
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+VERIFICATION_MESSAGES = {
+    "unverified": "Submit your LEA verification documents to unlock lookups.",
+    "pending": "Your LEA verification is under review. Lookups unlock once it is approved.",
+    "rejected": "Your LEA verification was rejected. Contact the administrator.",
+}
+
+
+# ─────────────────────────────────────────────
+# SINGLE-USE TOKENS (activation / password reset)
+# Stored hashed: a leaked database must not yield usable reset links.
+# ─────────────────────────────────────────────
+PASSWORD_RESET_TTL_HOURS = int(os.getenv("PASSWORD_RESET_TTL_HOURS", "24"))
+MIN_PASSWORD_LENGTH = 10
+
+
+def password_problem(password: str) -> str | None:
+    """Return a human-readable reason the password is unacceptable, or None."""
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        return "Password must contain both letters and numbers."
+    return None
+
+
+def issue_reset_token(cursor, user_id: int, purpose: str = "reset", issued_by: str = "") -> str:
+    """Create a single-use token, invalidating any outstanding ones for the user.
+
+    Returns the plaintext token — the only moment it exists in readable form.
+    """
+    token = secrets.token_urlsafe(32)
+    cursor.execute(
+        "UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=%s AND used_at IS NULL",
+        (user_id,),
+    )
+    cursor.execute(
+        """
+        INSERT INTO password_reset_tokens (user_id, token_hash, purpose, issued_by, expires_at)
+        VALUES (%s,%s,%s,%s, DATE_ADD(NOW(), INTERVAL %s HOUR))
+        """,
+        (user_id, generate_password_hash(token), purpose, issued_by or None, PASSWORD_RESET_TTL_HOURS),
+    )
+    return token
+
+
+def consume_reset_token(cursor, token: str):
+    """Validate and burn a token. Returns the user_id, or None if unusable.
+
+    The hash is salted per-row so we cannot look the token up directly; we scan
+    only live, unexpired rows, which is a small set.
+    """
+    if not token:
+        return None
+    cursor.execute(
+        """
+        SELECT id, user_id, token_hash FROM password_reset_tokens
+        WHERE used_at IS NULL AND expires_at > NOW()
+        ORDER BY created_at DESC LIMIT 200
+        """
+    )
+    for row in cursor.fetchall():
+        if check_password_hash(row["token_hash"], token):
+            cursor.execute("UPDATE password_reset_tokens SET used_at=NOW() WHERE id=%s", (row["id"],))
+            return row["user_id"]
+    return None
+
+
+def consume_recovery_code(cursor, user_row, code: str, table: str = "bot_users") -> bool:
+    """Verify a 2FA recovery code and remove it. Codes are single-use.
+
+    Stored as a JSON array of password hashes, so the matching one is found by
+    trial and the survivors are written back.
+    """
+    code = (code or "").strip()
+    if not code:
+        return False
+    try:
+        hashes = json.loads(user_row.get("recovery_codes_hash") or "[]")
+    except (ValueError, TypeError):
+        return False
+
+    matched = False
+    remaining = []
+    for stored in hashes:
+        if not matched and check_password_hash(stored, code):
+            matched = True
+            continue
+        remaining.append(stored)
+
+    if not matched:
+        return False
+    cursor.execute(
+        f"UPDATE {table} SET recovery_codes_hash=%s WHERE id=%s",
+        (json.dumps(remaining), user_row["id"]),
+    )
+    return True
+
+
 def mask_secret(value: str, keep: int = 4) -> str:
     if not value:
         return ""
@@ -256,7 +442,13 @@ def set_setting(key: str, value: str):
 
 
 def _client_ip():
-    return (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+    """Real peer address.
+
+    ProxyFix (configured at startup from TRUSTED_PROXY_COUNT) has already rewritten
+    request.remote_addr from the trusted number of X-Forwarded-For hops, so reading
+    the raw header here would re-introduce the spoof it exists to prevent.
+    """
+    return (request.remote_addr or "").strip()
 
 
 def table_has_column(table: str, column: str) -> bool:
@@ -337,6 +529,16 @@ def admin_page():
 @app.route("/register")
 def register_page():
     return render_template("register.html")
+
+
+@app.route("/pricing")
+def pricing_page():
+    return render_template("pricing.html")
+
+
+@app.route("/reset-password")
+def reset_password_page():
+    return render_template("reset_password.html")
 
 
 @app.route("/analysis")
@@ -495,15 +697,34 @@ def save_site_content():
 
 
 # ─────────────────────────────────────────────
-# LEA REGISTRATION
+# LEA VERIFICATION
+#
+# This used to be the public front door: an unauthenticated multipart endpoint
+# that wrote two files to disk per request, with no rate limit and no CAPTCHA.
+# Signup now comes first, so verification is submitted from inside the dashboard
+# by an account we can name, rate-limit and hold responsible. Identity fields come
+# from the signed-in account rather than the form, so an applicant cannot claim to
+# be a different officer than the one who signed in.
 # ─────────────────────────────────────────────
 @app.route("/api/lea/register", methods=["POST"])
+@user_required
+@rate_limit(max_requests=5, window_seconds=3600, per="user")
 def lea_register():
     form = request.form
-    required = ["full_name", "phone", "department", "designation", "service_id", "unit", "jurisdiction"]
+    required = ["department", "designation", "service_id", "unit", "jurisdiction"]
     for field in required:
         if not form.get(field):
             return jsonify({"error": f"Missing required field: {field}"}), 400
+
+    with db_conn() as conn:
+        account = load_current_user(conn.cursor(dictionary=True))
+    if not account:
+        session.clear()
+        return jsonify({"error": "Authentication required"}), 401
+    if account.get("verification_status") == "approved":
+        return jsonify({"error": "Your account is already verified."}), 409
+    if account.get("verification_status") == "pending":
+        return jsonify({"error": "You already have a verification request under review."}), 409
 
     gov_id = request.files.get("gov_id")
     dept_id = request.files.get("dept_id")
@@ -532,14 +753,15 @@ def lea_register():
     cursor.execute(
         """
         INSERT INTO lea_applications
-        (full_name, phone, official_email, department, designation, service_id,
+        (user_id, full_name, phone, official_email, department, designation, service_id,
          unit, jurisdiction, notes, id_proof_path, dept_id_path, status)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
         """,
         (
-            form["full_name"],
-            form["phone"],
-            form.get("official_email", ""),
+            account["id"],
+            account.get("name") or "",
+            account["phone"],
+            account.get("official_email") or "",
             form["department"],
             form["designation"],
             form["service_id"],
@@ -550,21 +772,122 @@ def lea_register():
             dept_id_filename,
         ),
     )
-    conn.commit()
     new_id = cursor.lastrowid
+    cursor.execute(
+        """
+        UPDATE bot_users
+        SET verification_status='pending', lea_application_id=%s, department=%s
+        WHERE id=%s
+        """,
+        (new_id, form["department"], account["id"]),
+    )
+    conn.commit()
     conn.close()
 
     application_id = f"LEA-{datetime.now().year}-{new_id:04d}"
-    return jsonify({"success": True, "application_id": application_id}), 200
+    log_activity(account["id"], "lea_verification_submitted", f"{account.get('name')} submitted {application_id}")
+    return jsonify({"success": True, "application_id": application_id, "verification_status": "pending"}), 200
 
 
 
 
 # ─────────────────────────────────────────────
-# USER AUTH (development phase)
-# Public user login page is /login. In production, make /dashboard user_required
-# and add email OTP/reset delivery through configured SMTP.
+# USER AUTH
+#
+# Self-serve signup. An account is created immediately with a password the user
+# chooses, and starts life unverified: it can sign in and see the dashboard,
+# pricing and its own profile, but every data route is behind @verified_required.
 # ─────────────────────────────────────────────
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+PHONE_RE = re.compile(r"^\+?\d{10,15}$")
+
+
+def normalise_phone(raw: str) -> str:
+    """Strip formatting so the same number cannot be registered twice in two shapes."""
+    cleaned = re.sub(r"[\s\-()]", "", (raw or "").strip())
+    return cleaned
+
+
+@app.route("/api/user/signup", methods=["POST"])
+@rate_limit(max_requests=5, window_seconds=3600, per="ip")
+def user_signup():
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    phone = normalise_phone(data.get("phone") or "")
+    password = data.get("password") or ""
+    ip = _client_ip()
+
+    if not name:
+        return jsonify({"error": "Full name is required"}), 400
+    if not EMAIL_RE.match(email):
+        return jsonify({"error": "Enter a valid email address"}), 400
+    if not PHONE_RE.match(phone):
+        return jsonify({"error": "Enter a valid phone number (10-15 digits)"}), 400
+    problem = password_problem(password)
+    if problem:
+        return jsonify({"error": problem}), 400
+
+    free_credits = int(get_setting("signup_free_credits", "0"))
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id FROM bot_users WHERE phone=%s OR official_email=%s LIMIT 1", (phone, email))
+    if cursor.fetchone():
+        conn.close()
+        # Deliberately vague: confirming which of the two is taken would let an
+        # attacker enumerate registered officers by phone number.
+        return jsonify({"error": "An account already exists for that phone or email. Try signing in."}), 409
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO bot_users
+                (phone, name, official_email, password_hash, password_set_at,
+                 credits, status, verification_status)
+            VALUES (%s,%s,%s,%s,NOW(),%s,'pending','unverified')
+            """,
+            (phone, name, email, generate_password_hash(password), free_credits),
+        )
+        user_id = cursor.lastrowid
+        if free_credits:
+            cursor.execute(
+                "INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'credit',%s,'signup_bonus')",
+                (phone, free_credits),
+            )
+        conn.commit()
+    except mysql.connector.Error:
+        conn.close()
+        return jsonify({"error": "An account already exists for that phone or email. Try signing in."}), 409
+    conn.close()
+
+    log_activity(user_id, "user_signup", f"{name} <{email}> signed up from {ip}")
+
+    session.clear()
+    session.permanent = True
+    session["is_user"] = True
+    session["user_id"] = user_id
+    session["user_phone"] = phone
+    session["user_name"] = name
+    session["user_department"] = ""
+    session["user_login_at"] = datetime.utcnow().isoformat()
+
+    return jsonify({
+        "success": True,
+        "redirect": "/dashboard",
+        "user": {
+            "id": user_id,
+            "phone": phone,
+            "name": name,
+            "email": email,
+            "credits": free_credits,
+            "status": "pending",
+            "verification_status": "unverified",
+        },
+    }), 201
+
+
+
 @app.route("/api/user/login", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP
 def user_login():
@@ -583,7 +906,9 @@ def user_login():
     try:
         cursor.execute(
             """
-            SELECT id, phone, name, department, official_email, password_hash, credits, status, twofa_enabled, twofa_secret,
+            SELECT id, phone, name, department, official_email, password_hash, credits, status,
+                   COALESCE(verification_status, 'unverified') AS verification_status,
+                   twofa_enabled, twofa_secret, recovery_codes_hash,
                    COALESCE(failed_login_count, 0) AS failed_login_count,
                    locked_until
             FROM bot_users
@@ -596,7 +921,8 @@ def user_login():
         cursor.execute(
             """
             SELECT id, phone, name, department, NULL AS official_email, password_hash, credits, status,
-                   0 AS twofa_enabled, NULL AS twofa_secret,
+                   'unverified' AS verification_status,
+                   0 AS twofa_enabled, NULL AS twofa_secret, NULL AS recovery_codes_hash,
                    0 AS failed_login_count, NULL AS locked_until
             FROM bot_users
             WHERE phone=%s
@@ -621,19 +947,17 @@ def user_login():
         conn.close()
         return jsonify({"error": "Account locked due to too many failed attempts.", "locked": True, "remaining_seconds": remaining}), 423
 
-    if user.get("status") != "approved":
+    # Unverified accounts may sign in — they just cannot query anything. Only an
+    # explicitly disabled account is refused at the door.
+    if user.get("status") in LOGIN_BLOCKED_STATUSES:
         conn.close()
-        return jsonify({"error": f"Account is {user.get('status')}. Access allowed only after approval."}), 403
+        return jsonify({"error": f"Account is {user.get('status')}. Contact the administrator."}), 403
 
     stored_hash = user.get("password_hash")
-    dev_password = os.getenv("DEV_USER_PASSWORD", "dev123")
 
-    password_ok = False
-    if stored_hash:
-        password_ok = check_password_hash(stored_hash, password)
-    else:
-        # Development convenience only. In production, force password setup/reset.
-        password_ok = (password == dev_password)
+    # No usable credential means fail closed. There is no fallback password: an
+    # account with no hash is one an admin must issue a reset token for.
+    password_ok = bool(stored_hash) and check_password_hash(stored_hash, password)
 
     if not password_ok:
         failed_count = int(user.get("failed_login_count") or 0) + 1
@@ -661,9 +985,16 @@ def user_login():
             conn.close()
             return jsonify({"error": "2FA code required", "twofa_required": True}), 401
         secret = decrypt_text(user.get("twofa_secret"))
-        if not secret or not pyotp.TOTP(secret).verify(otp, valid_window=1):
-            conn.close()
-            return jsonify({"error": "Invalid 2FA code", "twofa_required": True}), 401
+        totp_ok = bool(secret) and pyotp.TOTP(secret).verify(otp, valid_window=1)
+        if not totp_ok:
+            # Recovery codes were being generated and handed out but never checked,
+            # so losing an authenticator meant a permanent lockout. Accept one here
+            # and burn it — a recovery code is single-use by definition.
+            if not consume_recovery_code(cursor, user, otp):
+                conn.close()
+                return jsonify({"error": "Invalid 2FA code", "twofa_required": True}), 401
+            conn.commit()
+            log_activity(user["id"], "recovery_code_used", f"Recovery code consumed at login from {ip}")
 
     # Successful login — reset counter
     try:
@@ -673,6 +1004,9 @@ def user_login():
         pass
     conn.close()
 
+    # Regenerate the session on privilege change so a pre-login fixated cookie
+    # cannot be reused as an authenticated one.
+    session.clear()
     session.permanent = True
     session["is_user"] = True
     session["user_id"] = user["id"]
@@ -690,8 +1024,11 @@ def user_login():
             "id": user["id"],
             "phone": user["phone"],
             "name": user.get("name") or "Operator",
+            "email": user.get("official_email") or "",
             "department": user.get("department") or "",
             "credits": user.get("credits", 0),
+            "status": user.get("status"),
+            "verification_status": user.get("verification_status") or "unverified",
         },
     })
 
@@ -707,27 +1044,108 @@ def user_logout():
 
 @app.route("/api/user/session", methods=["GET"])
 def user_session():
+    """Live account state — credits and clearance are read from the database, not
+    the session cookie, so an admin revoking access takes effect on the next poll."""
     if not session.get("is_user"):
         return jsonify({"logged_in": False}), 401
+    user = load_current_user()
+    if not user:
+        session.clear()
+        return jsonify({"logged_in": False}), 401
+    if user.get("status") in LOGIN_BLOCKED_STATUSES:
+        session.clear()
+        return jsonify({"logged_in": False, "error": f"Account is {user.get('status')}."}), 401
+
+    state = user.get("verification_status") or "unverified"
     return jsonify({
         "logged_in": True,
         "user": {
-            "id": session.get("user_id"),
-            "phone": session.get("user_phone"),
-            "name": session.get("user_name"),
-            "department": session.get("user_department"),
+            "id": user["id"],
+            "phone": user["phone"],
+            "name": user.get("name"),
+            "email": user.get("official_email") or "",
+            "department": user.get("department") or "",
+            "credits": int(user.get("credits") or 0),
+            "status": user.get("status"),
+            "verification_status": state,
+            "verified": state == "approved",
+            "twofa_enabled": bool(user.get("twofa_enabled")),
+            "gate_message": "" if state == "approved" else VERIFICATION_MESSAGES.get(state, ""),
         },
     })
 
 
 @app.route("/api/user/password-reset/request", methods=["POST"])
+@rate_limit(max_requests=5, window_seconds=900, per="ip")
 def user_password_reset_request():
-    # Development placeholder. Production should generate OTP, store hashed OTP + expiry,
-    # and send only to government-authorized email domains through configured SMTP.
+    """Record a reset request for the admin queue.
+
+    SMTP and SMS are both off, so nothing can be delivered automatically. Rather
+    than returning a success message it does not honour, this files a request the
+    admin sees and answers by issuing a token out of band. The response is
+    identical whether or not the account exists, so it cannot be used to
+    enumerate registered officers.
+    """
     identifier = (request.json or {}).get("identifier", "").strip()
     if not identifier:
-        return jsonify({"error": "phone/email required"}), 400
-    return jsonify({"success": True, "message": "Password reset flow placeholder. Configure SMTP in admin for production OTP emails."})
+        return jsonify({"error": "Phone or email is required"}), 400
+
+    generic = {
+        "success": True,
+        "message": "If an account exists for that phone or email, the administrator "
+                   "has been notified and will issue a reset code out of band.",
+    }
+    try:
+        with db_conn() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT id, name FROM bot_users WHERE phone=%s OR official_email=%s LIMIT 1",
+                (normalise_phone(identifier), identifier.lower()),
+            )
+            row = cursor.fetchone()
+            if row:
+                log_activity(row["id"], "password_reset_requested",
+                             f"{row.get('name') or identifier} requested a password reset from {_client_ip()}")
+    except Exception:
+        pass
+    return jsonify(generic)
+
+
+@app.route("/api/user/password-reset/confirm", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=900, per="ip")
+def user_password_reset_confirm():
+    """Consume an admin-issued token and set a new password."""
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    password = data.get("password") or ""
+
+    if not token:
+        return jsonify({"error": "Reset code is required"}), 400
+    problem = password_problem(password)
+    if problem:
+        return jsonify({"error": problem}), 400
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    user_id = consume_reset_token(cursor, token)
+    if not user_id:
+        conn.rollback()
+        conn.close()
+        return jsonify({"error": "That reset code is invalid or has expired."}), 400
+
+    cursor.execute(
+        """
+        UPDATE bot_users
+        SET password_hash=%s, password_set_at=NOW(), failed_login_count=0, locked_until=NULL
+        WHERE id=%s
+        """,
+        (generate_password_hash(password), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+    log_activity(user_id, "password_reset_completed", f"Password set via reset code from {_client_ip()}")
+    return jsonify({"success": True, "message": "Password updated. You can now sign in.", "redirect": "/login"})
 
 
 # ─────────────────────────────────────────────
@@ -933,7 +1351,7 @@ def list_lea_applications():
 @admin_required
 def approve_lea_application(app_id):
     data = request.json or {}
-    free_credits = int(data.get("free_credits", os.getenv("DEFAULT_FREE_CREDITS", "20")))
+    free_credits = int(data.get("free_credits", get_setting("lea_approval_free_credits", os.getenv("DEFAULT_FREE_CREDITS", "20"))))
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT * FROM lea_applications WHERE id=%s", (app_id,))
@@ -945,27 +1363,35 @@ def approve_lea_application(app_id):
         conn.close()
         return jsonify({"error": f"Application already {application['status']}"}), 400
 
+    # Approval grants clearance to an account that already exists and already has
+    # a password the officer chose at signup. It must never mint an account here:
+    # that is what previously produced rows with no password_hash at all.
     phone = application["phone"]
-    cursor.execute("SELECT id FROM bot_users WHERE phone=%s", (phone,))
-    existing = cursor.fetchone()
-    if existing:
-        cursor.execute(
-            """
-            UPDATE bot_users SET status='approved', credits=credits+%s,
-            name=%s, department=%s, lea_application_id=%s WHERE phone=%s
-            """,
-            (free_credits, application["full_name"], application["department"], app_id, phone),
-        )
+    user_id = application.get("user_id")
+    if user_id:
+        cursor.execute("SELECT id FROM bot_users WHERE id=%s", (user_id,))
     else:
-        cursor.execute(
-            """
-            INSERT INTO bot_users (phone, name, department, credits, status, lea_application_id)
-            VALUES (%s,%s,%s,%s,'approved',%s)
-            """,
-            (phone, application["full_name"], application["department"], free_credits, app_id),
-        )
+        cursor.execute("SELECT id FROM bot_users WHERE phone=%s", (phone,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({
+            "error": "No account matches this application. The applicant must sign up "
+                     "before verification can be approved."
+        }), 409
+
+    cursor.execute(
+        """
+        UPDATE bot_users
+        SET status='approved', verification_status='approved', verified_at=NOW(),
+            credits=credits+%s, department=%s, lea_application_id=%s
+        WHERE id=%s
+        """,
+        (free_credits, application["department"], app_id, existing["id"]),
+    )
     cursor.execute("UPDATE lea_applications SET status='approved', reviewed_by=%s, reviewed_at=NOW() WHERE id=%s", (session.get("admin_name"), app_id))
-    cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'credit',%s,'lea_approval_bonus')", (phone, free_credits))
+    if free_credits:
+        cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'credit',%s,'lea_approval_bonus')", (phone, free_credits))
     conn.commit()
     conn.close()
     log_activity(session.get("admin_id"), "lea_approve", f"Approved LEA-{application['created_at'].year}-{app_id:04d} ({application['full_name']}) — {free_credits} credits granted")
@@ -987,6 +1413,18 @@ def reject_lea_application(app_id):
         "UPDATE lea_applications SET status='rejected', reviewed_by=%s, reviewed_at=NOW(), rejection_reason=%s WHERE id=%s",
         (session.get("admin_name"), reason, app_id),
     )
+    # The account survives a rejected application — the operator keeps their login
+    # and can correct and resubmit. Only clearance is withheld.
+    if application.get("user_id"):
+        cursor.execute(
+            "UPDATE bot_users SET verification_status='rejected', verification_note=%s WHERE id=%s",
+            (reason, application["user_id"]),
+        )
+    else:
+        cursor.execute(
+            "UPDATE bot_users SET verification_status='rejected', verification_note=%s WHERE phone=%s",
+            (reason, application["phone"]),
+        )
     conn.commit()
     conn.close()
     log_activity(session.get("admin_id"), "lea_reject", f"Rejected LEA-{application['created_at'].year}-{app_id:04d} ({application['full_name']}) — {reason}")
@@ -1021,13 +1459,13 @@ def list_users():
     if search:
         cursor.execute(
             """
-            SELECT id, phone, name, department, credits, status, block_reason, created_at, last_login_at, twofa_enabled
+            SELECT id, phone, name, department, official_email, credits, status, verification_status, block_reason, created_at, last_login_at, twofa_enabled
             FROM bot_users WHERE name LIKE %s OR phone LIKE %s ORDER BY created_at DESC LIMIT 100
             """,
             (f"%{search}%", f"%{search}%"),
         )
     else:
-        cursor.execute("SELECT id, phone, name, department, credits, status, block_reason, created_at, last_login_at, twofa_enabled FROM bot_users ORDER BY created_at DESC LIMIT 100")
+        cursor.execute("SELECT id, phone, name, department, official_email, credits, status, verification_status, block_reason, created_at, last_login_at, twofa_enabled FROM bot_users ORDER BY created_at DESC LIMIT 100")
     users = cursor.fetchall()
     conn.close()
     for u in users:
@@ -1096,9 +1534,36 @@ def update_user_status(user_id):
 @app.route("/api/admin/users/<int:user_id>/password-reset", methods=["POST"])
 @admin_required
 def admin_password_reset(user_id):
-    # Scaffold for OTP/email flow. Do not expose passwords. Generate a reset token/OTP and send to verified govt email.
-    log_activity(session.get("admin_id"), "password_reset_requested", f"Password reset initiated for user_id={user_id}")
-    return jsonify({"success": True, "message": "Password reset OTP should be sent to the user's government-authorized email."})
+    """Issue a single-use reset code for an operator.
+
+    SMTP is off, so the code is returned to the admin once, here, to be handed
+    over out of band — the same channel already used to tell an officer their
+    application was approved. It is stored hashed and cannot be retrieved again.
+    """
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, name, phone FROM bot_users WHERE id=%s", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+
+    token = issue_reset_token(cursor, user_id, purpose="reset", issued_by=session.get("admin_name") or "admin")
+    # Clear any lockout: the point of a reset is to restore access.
+    cursor.execute("UPDATE bot_users SET failed_login_count=0, locked_until=NULL WHERE id=%s", (user_id,))
+    conn.commit()
+    conn.close()
+
+    log_activity(session.get("admin_id"), "password_reset_issued",
+                 f"Reset code issued for {user.get('name') or user.get('phone')} (user_id={user_id})")
+    return jsonify({
+        "success": True,
+        "reset_token": token,
+        "expires_in_hours": PASSWORD_RESET_TTL_HOURS,
+        "reset_url": f"/reset-password?token={urllib.parse.quote(token)}",
+        "message": "Single-use reset code generated. Give it to the operator directly — "
+                   "it is shown once and cannot be retrieved again.",
+    })
 
 
 @app.route("/api/admin/stats", methods=["GET"])
@@ -1413,8 +1878,9 @@ def user_password_change():
     data = request.json or {}
     current_password = data.get("current_password", "")
     new_password = data.get("new_password", "")
-    if len(new_password) < 8:
-        return jsonify({"error": "New password must be at least 8 characters"}), 400
+    problem = password_problem(new_password)
+    if problem:
+        return jsonify({"error": problem}), 400
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT password_hash FROM bot_users WHERE id=%s", (session.get("user_id"),))
@@ -1423,17 +1889,24 @@ def user_password_change():
         conn.close()
         return jsonify({"error": "User not found"}), 404
     existing = row.get("password_hash")
-    if existing:
-        if not check_password_hash(existing, current_password):
-            conn.close()
-            return jsonify({"error": "Current password is incorrect"}), 401
-    else:
-        if current_password != os.getenv("DEV_USER_PASSWORD", "dev123"):
-            conn.close()
-            return jsonify({"error": "Current development password is incorrect"}), 401
-    cursor.execute("UPDATE bot_users SET password_hash=%s WHERE id=%s", (generate_password_hash(new_password), session.get("user_id")))
+    # No stored hash means no way to prove ownership here. Fail closed and send
+    # them through the admin-issued reset token instead of accepting a shared
+    # development password.
+    if not existing:
+        conn.close()
+        return jsonify({
+            "error": "This account has no password set. Ask the administrator for a reset code."
+        }), 409
+    if not check_password_hash(existing, current_password):
+        conn.close()
+        return jsonify({"error": "Current password is incorrect"}), 401
+    cursor.execute(
+        "UPDATE bot_users SET password_hash=%s, password_set_at=NOW() WHERE id=%s",
+        (generate_password_hash(new_password), session.get("user_id")),
+    )
     conn.commit()
     conn.close()
+    log_activity(session.get("user_id"), "password_changed", f"Password changed from {_client_ip()}")
     return jsonify({"success": True})
 
 
@@ -1584,8 +2057,54 @@ TOOL_CATEGORY_MAP = {
 }
 
 
+def charge_for_lookup(cursor, user, service, code, query, case_reference=""):
+    """Debit credits and write the audit trail for a lookup that returned data.
+
+    Called only once a result is in hand, so a miss is never billed. Returns the
+    number of credits actually charged.
+    """
+    credits = lookup_cost(service)
+    if credits:
+        cursor.execute(
+            "UPDATE bot_users SET credits = credits - %s WHERE id=%s AND credits >= %s",
+            (credits, user["id"], credits),
+        )
+        if cursor.rowcount != 1:
+            # Balance moved under us (concurrent lookup). Treat as unaffordable.
+            raise InsufficientCredits(credits)
+        cursor.execute(
+            "INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'debit',%s,%s)",
+            (user["phone"], credits, f"lookup:{code}"),
+        )
+    cursor.execute(
+        """
+        INSERT INTO search_logs (user_id, phone, search_type, query_value, case_reference,
+                                 credits_used, sources_queried)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (user["id"], user["phone"], code, query[:255], case_reference[:100] or None,
+         credits, (service or {}).get("name") or code),
+    )
+    return credits
+
+
+class InsufficientCredits(Exception):
+    def __init__(self, required):
+        super().__init__("Insufficient credits")
+        self.required = required
+
+
+def lookup_cost(service) -> int:
+    """Credits a single run of this service costs. Admin-editable per service."""
+    if not service:
+        return 0
+    if service.get("is_free"):
+        return 0
+    return int(service.get("credits_per_use") or 0)
+
+
 @app.route("/api/tools/run", methods=["POST"])
-@user_required
+@verified_required
 @rate_limit(max_requests=30, window_seconds=60, per="user")
 def run_tool_generic():
     """Live tool runner. Database lookup tools work without API dependency.
@@ -1594,6 +2113,7 @@ def run_tool_generic():
     data = request.json or {}
     code = (data.get("code") or "").strip()
     query = (data.get("query") or "").strip()
+    case_reference = (data.get("case_reference") or "").strip()
     if not code:
         return jsonify({"error": "tool code required"}), 400
     if not query:
@@ -1603,38 +2123,98 @@ def run_tool_generic():
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT * FROM services WHERE code=%s", (code,))
     service = cursor.fetchone()
-    if service and not service.get("is_enabled"):
+
+    # Fail closed on an unknown code. Every gate below used to be written as
+    # `if service and ...`, so a code with no services row skipped all of them and
+    # ran uncharged — which is exactly how `subscriber_lookup` became a free,
+    # unlimited alias of `mobile_lookup`. An absent row is not permission.
+    if not service:
+        conn.close()
+        return jsonify({"error": f"Unknown tool '{code}'."}), 404
+    if not service.get("is_enabled"):
         conn.close()
         return jsonify({"error": "This service is disabled by admin"}), 403
-    if service and service.get("maintenance_mode"):
+    if service.get("maintenance_mode"):
         conn.close()
         return jsonify({"error": "This service is currently in maintenance mode"}), 503
-    if service and service.get("status") == "upcoming":
+    if service.get("status") == "upcoming":
         conn.close()
         return jsonify({"error": "This tool is marked as Coming Soon by admin"}), 403
+
+    user = load_current_user(cursor)
+    if not user:
+        conn.close()
+        session.clear()
+        return jsonify({"error": "Authentication required"}), 401
+
+    # Affordability is checked up front so the user is told before the query runs,
+    # but the debit happens only if data actually comes back.
+    credits_required = lookup_cost(service)
+    credits_available = int(user.get("credits") or 0)
+    if credits_required > credits_available:
+        conn.close()
+        return jsonify({
+            "error": "Insufficient credits for this lookup.",
+            "reason": "insufficient_credits",
+            "credits_required": credits_required,
+            "credits_available": credits_available,
+        }), 402
 
     results = []
     errors = []
 
     # 1) Native database lookup tools — no API dependency required.
     try:
-        if code in {"mobile_lookup", "subscriber_lookup"}:
+        if code == "mobile_lookup":
             cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query,))
             row = cursor.fetchone()
             if row:
-                conn.close()
-                return jsonify({"success": True, "tool": code, "query": query, "results": [{"source": "Subscriber Database", "status": "ok", "data": _json_clean(row)}]})
+                try:
+                    charged = charge_for_lookup(cursor, user, service, code, query, case_reference)
+                except InsufficientCredits as exc:
+                    conn.rollback(); conn.close()
+                    return jsonify({
+                        "error": "Insufficient credits for this lookup.",
+                        "reason": "insufficient_credits",
+                        "credits_required": exc.required,
+                        "credits_available": credits_available,
+                    }), 402
+                conn.commit(); conn.close()
+                return jsonify({
+                    "success": True, "tool": code, "query": query,
+                    "credits_charged": charged,
+                    "credits_remaining": credits_available - charged,
+                    "results": [{"source": "Subscriber Database", "status": "ok", "data": _json_clean(row)}],
+                })
             # Fallback to generic uploaded records if old importer was used.
+            # Exact key only: the previous `data_json LIKE '%query%'` substring match
+            # could bill for — and print a PDF from — an unrelated record that merely
+            # contained the digits somewhere in its JSON.
             try:
-                cursor.execute("SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND (record_key=%s OR data_json LIKE %s) ORDER BY created_at DESC LIMIT 20", (query, f"%{query}%"))
+                cursor.execute("SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND record_key=%s ORDER BY created_at DESC LIMIT 20", (query,))
                 rows = cursor.fetchall()
                 if rows:
                     for r in rows:
                         try: r["data"] = json.loads(r.get("data_json") or "{}")
                         except Exception: r["data"] = r.get("data_json")
-                    conn.close()
-                    return jsonify({"success": True, "tool": code, "query": query, "results": [{"source": "Uploaded Master Data", "status": "ok", "data": rows}]})
-            except Exception:
+                    try:
+                        charged = charge_for_lookup(cursor, user, service, code, query, case_reference)
+                    except InsufficientCredits as exc:
+                        conn.rollback(); conn.close()
+                        return jsonify({
+                            "error": "Insufficient credits for this lookup.",
+                            "reason": "insufficient_credits",
+                            "credits_required": exc.required,
+                            "credits_available": credits_available,
+                        }), 402
+                    conn.commit(); conn.close()
+                    return jsonify({
+                        "success": True, "tool": code, "query": query,
+                        "credits_charged": charged,
+                        "credits_remaining": credits_available - charged,
+                        "results": [{"source": "Uploaded Master Data", "status": "ok", "data": rows}],
+                    })
+            except mysql.connector.Error:
                 pass
 
         if code == "vehicle_lookup":
@@ -1697,7 +2277,7 @@ def run_tool_generic():
         key = decrypt_text(integ.get("api_key"))
         secret = decrypt_text(integ.get("api_secret"))
         try:
-            if "twilio" in name and code in {"mobile_lookup", "subscriber_lookup"}:
+            if "twilio" in name and code == "mobile_lookup":
                 auth = base64.b64encode(f"{key}:{secret}".encode()).decode()
                 url = f"{base or 'https://lookups.twilio.com/v2'}/PhoneNumbers/{urllib.parse.quote(query)}"
                 resp = _http_json(url, None, {"Authorization": f"Basic {auth}"}, method="GET")
@@ -1744,7 +2324,7 @@ def run_tool_generic():
     if results:
         return jsonify({"success": True, "tool": code, "query": query, "results": results, "errors": errors})
 
-    if code in {"mobile_lookup", "subscriber_lookup"}:
+    if code == "mobile_lookup":
         return jsonify({"success": False, "error": "No subscriber record found. Upload Subscriber Database from Admin → Data Upload. Optional: configure Twilio/Numverify API for external phone intelligence.", "errors": errors}), 404
     return jsonify({"success": False, "error": f"No working connector/data found for tool '{code}'. Configure API dependency or upload database.", "errors": errors}), 400
 
@@ -2646,6 +3226,476 @@ def rollback_batch_v2(batch_id):
         try: cur.execute(f'DELETE FROM {table} WHERE {col}=%s',(batch_id,)); deleted+=cur.rowcount
         except Exception: pass
     conn.commit(); conn.close(); return jsonify({'success':True,'deleted':deleted})
+
+# ─────────────────────────────────────────────
+# PLANS, CREDITS AND PAYMENTS
+#
+# Credits are the only unit of account: a plan is a bundle of credits at a price,
+# not a recurring subscription. Buying credits never grants data clearance — that
+# comes from LEA verification alone.
+#
+# Payment providers sit behind PaymentProvider so the gateway can be swapped
+# without touching the crediting path. Today the only live provider is `manual`
+# (admin confirms an out-of-band transfer). A Razorpay adapter is implemented and
+# inert; set PAYMENTS_PROVIDER=razorpay with keys present to activate it. Both
+# funnel into credit_payment_order(), so credits are granted in exactly one place.
+# ─────────────────────────────────────────────
+def _plan_public(row):
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "credits": int(row["credits"]),
+        "price_inr": int(row["price_inr"]),
+        "description": row.get("description") or "",
+        "is_featured": bool(row.get("is_featured")),
+        "per_credit": round(int(row["price_inr"]) / int(row["credits"]), 2) if row.get("credits") else 0,
+    }
+
+
+@app.route("/api/plans", methods=["GET"])
+def list_plans():
+    """Public pricing. Safe to serve unauthenticated — it is a price list."""
+    try:
+        with db_conn() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT * FROM recharge_plans WHERE is_active=1 ORDER BY sort_order, price_inr"
+            )
+            plans = [_plan_public(r) for r in cursor.fetchall()]
+    except Exception:
+        plans = []
+    return jsonify({"plans": plans, "provider": active_payment_provider().name})
+
+
+@app.route("/api/admin/plans", methods=["GET"])
+@admin_required
+def admin_list_plans():
+    with db_conn() as conn:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM recharge_plans ORDER BY sort_order, price_inr")
+        rows = cursor.fetchall()
+    for r in rows:
+        r["is_active"] = bool(r.get("is_active"))
+        r["is_featured"] = bool(r.get("is_featured"))
+    return jsonify(rows)
+
+
+@app.route("/api/admin/plans", methods=["POST"])
+@admin_required
+def admin_save_plan():
+    """Create or update a plan. Admin owns credits, price and visibility."""
+    data = request.json or {}
+    plan_id = data.get("id")
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Plan name is required"}), 400
+    try:
+        credits = int(data.get("credits"))
+        price = int(data.get("price_inr"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Credits and price must be whole numbers"}), 400
+    if credits <= 0 or price < 0:
+        return jsonify({"error": "Credits must be positive and price cannot be negative"}), 400
+
+    fields = (
+        name, credits, price, (data.get("description") or "").strip() or None,
+        int(data.get("sort_order") or 0), 1 if data.get("is_featured") else 0,
+        0 if data.get("is_active") is False else 1,
+    )
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        if plan_id:
+            cursor.execute(
+                """
+                UPDATE recharge_plans
+                SET name=%s, credits=%s, price_inr=%s, description=%s,
+                    sort_order=%s, is_featured=%s, is_active=%s
+                WHERE id=%s
+                """,
+                fields + (int(plan_id),),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO recharge_plans
+                    (name, credits, price_inr, description, sort_order, is_featured, is_active)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """,
+                fields,
+            )
+            plan_id = cursor.lastrowid
+        conn.commit()
+    except mysql.connector.Error as exc:
+        conn.close()
+        return jsonify({"error": f"Could not save plan: {exc}"}), 400
+    conn.close()
+    log_activity(session.get("admin_id"), "plan_saved", f"Plan '{name}' — {credits} credits at ₹{price}")
+    return jsonify({"success": True, "id": plan_id})
+
+
+@app.route("/api/admin/plans/<int:plan_id>", methods=["DELETE"])
+@admin_required
+def admin_delete_plan(plan_id):
+    """Retire a plan. Never hard-deleted — historic orders reference it."""
+    with db_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE recharge_plans SET is_active=0 WHERE id=%s", (plan_id,))
+        conn.commit()
+    log_activity(session.get("admin_id"), "plan_retired", f"Plan id={plan_id} retired")
+    return jsonify({"success": True})
+
+
+# ── Provider abstraction ──────────────────────
+class PaymentProvider:
+    """Contract every gateway adapter implements.
+
+    create_order() may return a `checkout` payload the frontend hands to the
+    gateway's SDK. verify_webhook() must authenticate the callback before any
+    credit is granted.
+    """
+
+    name = "base"
+    is_live = False
+
+    def create_order(self, order_ref, amount_inr, user):
+        raise NotImplementedError
+
+    def verify_webhook(self, raw_body: bytes, headers) -> tuple[bool, dict]:
+        raise NotImplementedError
+
+
+class ManualProvider(PaymentProvider):
+    """No gateway. The order is filed as pending and an admin confirms payment
+    received out of band, which credits the account through the same path a
+    gateway webhook would use."""
+
+    name = "manual"
+    is_live = True
+
+    def create_order(self, order_ref, amount_inr, user):
+        return {
+            "provider": self.name,
+            "provider_order_id": order_ref,
+            "checkout": None,
+            "instructions": get_setting(
+                "manual_payment_instructions",
+                "Your order has been placed. Transfer the amount using the details "
+                "shared by the administrator, quoting your order reference. Credits "
+                "are added once payment is confirmed.",
+            ),
+        }
+
+    def verify_webhook(self, raw_body, headers):
+        return False, {}
+
+
+class RazorpayProvider(PaymentProvider):
+    """Razorpay adapter — complete but inert until keys are configured.
+
+    Deliberately uses urllib rather than the razorpay SDK so the dependency list
+    does not change before the account exists. To go live:
+      1. set RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET in .env
+      2. set PAYMENTS_PROVIDER=razorpay (or the payments_provider app setting)
+      3. set RAZORPAY_WEBHOOK_SECRET and point the Razorpay dashboard webhook at
+         POST /api/payments/webhook/razorpay for the `payment.captured` event
+    Nothing else has to change: crediting already runs through
+    credit_payment_order().
+    """
+
+    name = "razorpay"
+    API_BASE = "https://api.razorpay.com/v1"
+
+    def __init__(self):
+        self.key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+        self.key_secret = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
+        self.webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
+
+    @property
+    def is_live(self):
+        return bool(self.key_id and self.key_secret)
+
+    def _auth_header(self):
+        token = base64.b64encode(f"{self.key_id}:{self.key_secret}".encode()).decode()
+        return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+
+    def create_order(self, order_ref, amount_inr, user):
+        if not self.is_live:
+            raise RuntimeError("Razorpay keys are not configured")
+        payload = {
+            "amount": int(amount_inr) * 100,  # Razorpay bills in paise
+            "currency": "INR",
+            "receipt": order_ref,
+            "notes": {"order_ref": order_ref, "user_id": str(user["id"])},
+        }
+        data = _http_json(f"{self.API_BASE}/orders", payload, self._auth_header(), method="POST", timeout=20)
+        return {
+            "provider": self.name,
+            "provider_order_id": data.get("id"),
+            "checkout": {
+                "key": self.key_id,
+                "order_id": data.get("id"),
+                "amount": data.get("amount"),
+                "currency": data.get("currency", "INR"),
+                "name": "SENTINEL",
+                "prefill": {
+                    "name": user.get("name") or "",
+                    "email": user.get("official_email") or "",
+                    "contact": user.get("phone") or "",
+                },
+            },
+            "instructions": "",
+        }
+
+    def verify_webhook(self, raw_body, headers):
+        signature = headers.get("X-Razorpay-Signature", "")
+        if not self.webhook_secret or not signature:
+            return False, {}
+        expected = hmac.new(self.webhook_secret.encode(), raw_body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return False, {}
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return False, {}
+        entity = (body.get("payload", {}).get("payment", {}) or {}).get("entity", {})
+        return True, {
+            "event": body.get("event"),
+            "provider_order_id": entity.get("order_id"),
+            "provider_payment_id": entity.get("id"),
+            "paid": body.get("event") == "payment.captured",
+        }
+
+
+PAYMENT_PROVIDERS = {"manual": ManualProvider, "razorpay": RazorpayProvider}
+
+
+def active_payment_provider() -> PaymentProvider:
+    """Resolve the configured provider, falling back to manual if it is not usable.
+
+    Falling back rather than erroring means a half-configured gateway degrades to
+    'admin confirms the transfer' instead of taking the whole checkout offline.
+    """
+    choice = (get_setting("payments_provider", os.getenv("PAYMENTS_PROVIDER", "manual")) or "manual").lower()
+    provider = PAYMENT_PROVIDERS.get(choice, ManualProvider)()
+    if not provider.is_live:
+        return ManualProvider()
+    return provider
+
+
+def credit_payment_order(cursor, order_row, provider_payment_id=None, confirmed_by=None) -> bool:
+    """Grant the credits for a paid order. The single crediting path.
+
+    Idempotent: an order already marked paid returns False and does nothing, so a
+    replayed webhook or a double-click on 'Mark Paid' cannot credit twice.
+    """
+    if order_row["status"] == "paid":
+        return False
+    cursor.execute(
+        """
+        UPDATE payment_orders
+        SET status='paid', credited_at=NOW(), provider_payment_id=%s, confirmed_by=%s
+        WHERE id=%s AND status<>'paid'
+        """,
+        (provider_payment_id, confirmed_by, order_row["id"]),
+    )
+    if cursor.rowcount != 1:
+        return False
+    cursor.execute(
+        "UPDATE bot_users SET credits = credits + %s WHERE id=%s",
+        (order_row["credits"], order_row["user_id"]),
+    )
+    cursor.execute(
+        "INSERT INTO credit_transactions (phone, type, amount, reason, razorpay_order_id, status) "
+        "VALUES (%s,'credit',%s,%s,%s,'success')",
+        (order_row["phone"], order_row["credits"], f"purchase:{order_row['plan_name'] or 'custom'}",
+         order_row.get("provider_order_id")),
+    )
+    return True
+
+
+@app.route("/api/payments/checkout", methods=["POST"])
+@user_required
+@rate_limit(max_requests=10, window_seconds=600, per="user")
+def payments_checkout():
+    """Place an order for a credit plan.
+
+    Available to any signed-in user, verified or not — buying credits is not the
+    gated action; using them is.
+    """
+    data = request.json or {}
+    plan_id = data.get("plan_id")
+    if not plan_id:
+        return jsonify({"error": "plan_id is required"}), 400
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    user = load_current_user(cursor)
+    if not user:
+        conn.close(); session.clear()
+        return jsonify({"error": "Authentication required"}), 401
+
+    cursor.execute("SELECT * FROM recharge_plans WHERE id=%s AND is_active=1", (plan_id,))
+    plan = cursor.fetchone()
+    if not plan:
+        conn.close()
+        return jsonify({"error": "That plan is not available"}), 404
+
+    provider = active_payment_provider()
+    order_ref = f"SNT-{datetime.now():%Y%m%d}-{secrets.token_hex(4).upper()}"
+    try:
+        provider_payload = provider.create_order(order_ref, plan["price_inr"], user)
+    except Exception as exc:
+        conn.close()
+        return jsonify({"error": f"Could not start checkout: {exc}"}), 502
+
+    cursor.execute(
+        """
+        INSERT INTO payment_orders
+            (order_ref, user_id, phone, plan_id, plan_name, credits, amount_inr,
+             provider, provider_order_id, status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
+        """,
+        (order_ref, user["id"], user["phone"], plan["id"], plan["name"], plan["credits"],
+         plan["price_inr"], provider.name, provider_payload.get("provider_order_id")),
+    )
+    conn.commit()
+    conn.close()
+
+    log_activity(user["id"], "payment_order_created",
+                 f"{user.get('name')} ordered {plan['name']} ({plan['credits']} credits, ₹{plan['price_inr']}) via {provider.name}")
+    return jsonify({
+        "success": True,
+        "order_ref": order_ref,
+        "plan": _plan_public(plan),
+        "provider": provider.name,
+        "checkout": provider_payload.get("checkout"),
+        "instructions": provider_payload.get("instructions", ""),
+        "status": "pending",
+    }), 201
+
+
+@app.route("/api/payments/orders", methods=["GET"])
+@user_required
+def payments_my_orders():
+    with db_conn() as conn:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT order_ref, plan_name, credits, amount_inr, provider, status, created_at, credited_at
+            FROM payment_orders WHERE user_id=%s ORDER BY created_at DESC LIMIT 50
+            """,
+            (session.get("user_id"),),
+        )
+        rows = cursor.fetchall()
+    for r in rows:
+        r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
+        r["credited_at"] = r["credited_at"].isoformat() if r.get("credited_at") else None
+    return jsonify(rows)
+
+
+@app.route("/api/payments/webhook/<provider_name>", methods=["POST"])
+def payments_webhook(provider_name):
+    """Gateway callback. Unauthenticated by necessity — authenticity comes from
+    the provider's signature, which is verified before anything is credited."""
+    provider_cls = PAYMENT_PROVIDERS.get((provider_name or "").lower())
+    if not provider_cls or provider_cls is ManualProvider:
+        return jsonify({"error": "Unknown provider"}), 404
+
+    provider = provider_cls()
+    ok, event = provider.verify_webhook(request.get_data(), request.headers)
+    if not ok:
+        log_activity(None, "payment_webhook_rejected", f"Bad signature on {provider_name} webhook from {_client_ip()}")
+        return jsonify({"error": "Invalid signature"}), 400
+    if not event.get("paid"):
+        return jsonify({"success": True, "ignored": event.get("event")})
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM payment_orders WHERE provider=%s AND provider_order_id=%s LIMIT 1",
+        (provider.name, event.get("provider_order_id")),
+    )
+    order = cursor.fetchone()
+    if not order:
+        conn.close()
+        return jsonify({"error": "Unknown order"}), 404
+
+    granted = credit_payment_order(cursor, order, event.get("provider_payment_id"), confirmed_by=provider.name)
+    conn.commit()
+    conn.close()
+    if granted:
+        log_activity(order["user_id"], "payment_captured",
+                     f"{order['order_ref']} paid via {provider.name} — {order['credits']} credits granted")
+    return jsonify({"success": True, "credited": granted})
+
+
+@app.route("/api/admin/payments/orders", methods=["GET"])
+@admin_required
+def admin_payment_orders():
+    status = (request.args.get("status") or "").strip()
+    query = """
+        SELECT o.*, u.name AS user_name, u.official_email
+        FROM payment_orders o LEFT JOIN bot_users u ON u.id = o.user_id
+    """
+    params = ()
+    if status in {"pending", "paid", "failed", "cancelled"}:
+        query += " WHERE o.status=%s"
+        params = (status,)
+    query += " ORDER BY o.created_at DESC LIMIT 200"
+    with db_conn() as conn:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+    for r in rows:
+        r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
+        r["credited_at"] = r["credited_at"].isoformat() if r.get("credited_at") else None
+        r["updated_at"] = r["updated_at"].isoformat() if r.get("updated_at") else None
+    return jsonify(rows)
+
+
+@app.route("/api/admin/payments/orders/<int:order_id>/mark-paid", methods=["POST"])
+@admin_required
+def admin_mark_order_paid(order_id):
+    """Confirm an out-of-band payment and release the credits."""
+    note = ((request.json or {}).get("note") or "").strip()
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM payment_orders WHERE id=%s", (order_id,))
+    order = cursor.fetchone()
+    if not order:
+        conn.close()
+        return jsonify({"error": "Order not found"}), 404
+
+    granted = credit_payment_order(cursor, order, None, confirmed_by=session.get("admin_name") or "admin")
+    if granted and note:
+        cursor.execute("UPDATE payment_orders SET notes=%s WHERE id=%s", (note, order_id))
+    conn.commit()
+    conn.close()
+
+    if not granted:
+        return jsonify({"error": "Order is already marked paid.", "credited": False}), 409
+    log_activity(session.get("admin_id"), "payment_marked_paid",
+                 f"{order['order_ref']} confirmed manually — {order['credits']} credits to {order['phone']}")
+    return jsonify({"success": True, "credited": True, "credits": order["credits"]})
+
+
+@app.route("/api/admin/payments/orders/<int:order_id>/cancel", methods=["POST"])
+@admin_required
+def admin_cancel_order(order_id):
+    with db_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE payment_orders SET status='cancelled' WHERE id=%s AND status='pending'",
+            (order_id,),
+        )
+        changed = cursor.rowcount
+        conn.commit()
+    if not changed:
+        return jsonify({"error": "Only a pending order can be cancelled."}), 409
+    log_activity(session.get("admin_id"), "payment_cancelled", f"Order id={order_id} cancelled")
+    return jsonify({"success": True})
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)

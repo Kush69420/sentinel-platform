@@ -10,3 +10,4 @@ output.pdf
 .DS_Store
 node_modules/
 *.html.bak-*
+.claude/
