@@ -43,6 +43,95 @@ packaging. `app.run(debug=True, host="0.0.0.0")` is still the only way to start 
 the Werkzeug interactive debugger is remote code execution, so **do not expose this
 as-is**.
 
+## Reminder (2026-08-10)
+
+Follow up on the "Known Issues / Security Debt" list below. As of 2026-08-10,
+two of the three original Critical items are fixed and shipped: the stored
+XSS in the admin LEA verification queue, and the unauthenticated CDR/IPDR
+workspace endpoint (both now require `@admin_required`). Only the hardcoded
+default admin credential remains open, and it's intentionally deferred (see
+Decision below), not forgotten.
+
+**Decision (2026-08-10):** the hardcoded default admin credential item is
+intentionally deferred, not skipped. It will be fixed together with RBAC
+enforcement (the `role_required(*roles)` High item) as one pass, done right
+before deployment rather than now — forcing rotation/seed removal ahead of
+having roles enforced would just mean redoing the admin-bootstrap flow twice.
+
+## Known Issues / Security Debt (pre-existing, not yet patched)
+
+> **Provenance (updated after the `day1-selfserve-auth` merge):** this list was
+> compiled 2026-08-09, *before* the self-serve signup / clearance-gate work. Items
+> struck through below were fixed by that branch. Everything else is believed still
+> open — **confirm against source before fixing**, since the sweep predates a large
+> refactor of `app.py`. Two Day-2 items on the 5-day plan are already closed and are
+> not repeated here: the unauthenticated public registration surface (now
+> authenticated and rate-limited) and the spoofable `X-Forwarded-For` client IP
+> (now `ProxyFix` + `TRUSTED_PROXY_COUNT`).
+
+Found during a full-codebase security sweep (2026-08-09), after Day 1 (§3.1
+mobile_lookup credit/audit) and the auth review were already fixed. Nothing
+below overlaps with the credit-race, `/api/me` IDOR, `/dashboard` guard,
+login-enumeration, stored-XSS-in-verification-queue, or CDR/IPDR-workspace-auth
+fixes already shipped — those are done.
+
+### Critical
+
+- **Hardcoded default admin credential, no forced rotation**
+  (`db_setup.sql`, `INSERT INTO admin_users ... ('admin', <hash of
+  'admin123'>, 'super_admin')`). Runs on every fresh setup; only a comment
+  says "CHANGE IMMEDIATELY," nothing enforces it. Fix: force a password
+  change on first login for this seeded account, or drop the seed and
+  require an explicit admin-creation step during deploy. **Deferred** —
+  see Decision above; will be fixed together with RBAC enforcement.
+
+### High
+
+- **No CSRF protection anywhere** — no tokens, no `SameSite` cookie config.
+  Every session-authenticated state-changing endpoint is forgeable by a page
+  the victim's browser visits while logged in.
+- **RBAC modeled but never enforced** — `admin_users.role` is
+  `ENUM('super_admin','manager','support')` and a `role_required(*roles)`
+  decorator exists (`app.py`) but is never applied to any route. Every admin,
+  regardless of role, gets full `@admin_required` super-admin power.
+- **CLI execution endpoint = admin-to-RCE** (`/api/admin/tools/<id>/cli-test`,
+  `app.py`) — any admin (not just `super_admin`, per the RBAC gap above) can
+  run arbitrary shell commands via admin-configured `external_command`
+  templates. `{query}` is substituted before `shlex.split`, so not
+  shell-metacharacter injectable, but is argument-injectable into whatever
+  binary is configured.
+- **`app.run(debug=True, host="0.0.0.0", port=5000)`** — Werkzeug's
+  interactive debugger is RCE if reachable; bound to all interfaces.
+- **Insecure fallback `SECRET_KEY`**: `os.getenv("SECRET_KEY",
+  "dev_secret_change_this")`. If unset in prod, session cookies (including
+  `is_admin=True`) are forgeable.
+
+### Medium
+
+- No rate limiting on `/api/admin/login` (unlike `/api/user/login`). The
+  3-attempt lockout also doubles as a DoS lever against the real admin.
+- No security headers anywhere (no CSP, `X-Frame-Options`,
+  `X-Content-Type-Options`, HSTS).
+- Session cookie not hardened — no `SESSION_COOKIE_SECURE` /
+  `SESSION_COOKIE_SAMESITE` set, so Flask's insecure defaults apply.
+- ~~Backdoor dev password (`app.py`, `user_password_change()`)~~ — **FIXED in
+  `day1-selfserve-auth`.** Both the login and password-change fallbacks are gone
+  and `DEV_USER_PASSWORD` has been removed from `app.py` and `.env`. An account
+  with no `password_hash` now fails closed and needs an admin-issued reset code.
+- Ephemeral encryption key: if `ENCRYPTION_KEY` isn't in `.env`, a new Fernet
+  key is generated *every restart*, permanently bricking previously
+  encrypted gov-ID uploads, 2FA secrets, integration API keys, SMTP
+  passwords.
+
+### Low
+
+- `/uploads/<filename>` builds the filesystem path directly from the URL
+  segment — admin-only, but no `secure_filename`/basename guard as
+  defense-in-depth.
+- `/api/events` is an unauthenticated SSE endpoint with an infinite
+  per-connection generator loop — connection-exhaustion DoS vector, no data
+  exposure.
+
 ## Future / Deferred Modules
 
 ### UPI / Financial Registry Verification (not scheduled — post Mobile-OSINT-go-live)

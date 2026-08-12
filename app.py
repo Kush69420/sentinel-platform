@@ -40,10 +40,16 @@ import pyotp
 import qrcode
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from flask import (
     Flask,
     Response,
     jsonify,
+    redirect,
     render_template,
     request,
     send_from_directory,
@@ -518,6 +524,8 @@ def login_page():
 
 @app.route("/dashboard")
 def dashboard_page():
+    if not session.get("is_user"):
+        return redirect("/login")
     return render_template("dashboard.html")
 
 
@@ -553,29 +561,29 @@ def cdr_analysis_page():
 # ─────────────────────────────────────────────
 OSINT_TOOLS = [
     {"code": "mobile_lookup", "name": "Mobile Lookup", "icon": "📱", "category": "phone", "credits": 2, "status": "active", "description": "Lookup mobile number intelligence"},
-    {"code": "email_lookup", "name": "Email Lookup", "icon": "✉️", "category": "email", "credits": 2, "status": "active", "description": "Lookup email intelligence"},
-    {"code": "username_lookup", "name": "Username Lookup", "icon": "👤", "category": "identity", "credits": 2, "status": "active", "description": "Search public username footprint"},
-    {"code": "vehicle_lookup", "name": "Vehicle Lookup", "icon": "🚗", "category": "registry", "credits": 3, "status": "active", "description": "Vehicle registration intelligence"},
-    {"code": "ip_lookup", "name": "IP Lookup", "icon": "🌐", "category": "network", "credits": 2, "status": "active", "description": "IP reputation and geo intel"},
-    {"code": "domain_lookup", "name": "Domain Lookup", "icon": "◎", "category": "domain", "credits": 2, "status": "active", "description": "WHOIS, DNS and infrastructure"},
-    {"code": "social_media_lookup", "name": "Social Media Lookup", "icon": "🔗", "category": "social", "credits": 4, "status": "active", "description": "Public social profile intelligence"},
-    {"code": "breach_search", "name": "Data Breach Search", "icon": "⚠️", "category": "breach", "credits": 4, "status": "active", "description": "Breach and exposure indicators"},
-    {"code": "reverse_image", "name": "Reverse Image Search", "icon": "🖼️", "category": "image", "credits": 3, "status": "active", "description": "Image intelligence workflow"},
-    {"code": "address_osint", "name": "Address OSINT", "icon": "📍", "category": "maps", "credits": 2, "status": "active", "description": "Address and map intelligence"},
-    {"code": "aadhaar_validator", "name": "Aadhaar Validation", "icon": "🪪", "category": "identity", "credits": 1, "status": "active", "description": "Checksum/format validation only"},
-    {"code": "universal_search", "name": "Universal Search", "icon": "🔎", "category": "multi", "credits": 5, "status": "active", "description": "One search across enabled sources"},
+    {"code": "email_lookup", "name": "Email Lookup", "icon": "✉️", "category": "email", "credits": 2, "status": "upcoming", "description": "Lookup email intelligence"},
+    {"code": "username_lookup", "name": "Username Lookup", "icon": "👤", "category": "identity", "credits": 2, "status": "upcoming", "description": "Search public username footprint"},
+    {"code": "vehicle_lookup", "name": "Vehicle Lookup", "icon": "🚗", "category": "registry", "credits": 3, "status": "upcoming", "description": "Vehicle registration intelligence"},
+    {"code": "ip_lookup", "name": "IP Lookup", "icon": "🌐", "category": "network", "credits": 2, "status": "upcoming", "description": "IP reputation and geo intel"},
+    {"code": "domain_lookup", "name": "Domain Lookup", "icon": "◎", "category": "domain", "credits": 2, "status": "upcoming", "description": "WHOIS, DNS and infrastructure"},
+    {"code": "social_media_lookup", "name": "Social Media Lookup", "icon": "🔗", "category": "social", "credits": 4, "status": "upcoming", "description": "Public social profile intelligence"},
+    {"code": "breach_search", "name": "Data Breach Search", "icon": "⚠️", "category": "breach", "credits": 4, "status": "upcoming", "description": "Breach and exposure indicators"},
+    {"code": "reverse_image", "name": "Reverse Image Search", "icon": "🖼️", "category": "image", "credits": 3, "status": "upcoming", "description": "Image intelligence workflow"},
+    {"code": "address_osint", "name": "Address OSINT", "icon": "📍", "category": "maps", "credits": 2, "status": "upcoming", "description": "Address and map intelligence"},
+    {"code": "aadhaar_validator", "name": "Aadhaar Validation", "icon": "🪪", "category": "identity", "credits": 1, "status": "upcoming", "description": "Checksum/format validation only"},
+    {"code": "universal_search", "name": "Universal Search", "icon": "🔎", "category": "multi", "credits": 5, "status": "upcoming", "description": "One search across enabled sources"},
 ]
 
 ANALYZER_TOOLS = [
-    {"code": "cdr_analysis", "name": "CDR Analysis", "icon": "📞", "category": "telecom", "credits": 10, "status": "active", "description": "Analyze uploaded CDR CSV"},
-    {"code": "ipdr_analysis", "name": "IPDR Analysis", "icon": "📶", "category": "telecom", "credits": 10, "status": "active", "description": "Analyze uploaded IPDR CSV"},
-    {"code": "bank_statement", "name": "Bank Statement Analysis", "icon": "🏦", "category": "financial", "credits": 15, "status": "active", "description": "Transaction pattern analytics"},
-    {"code": "call_pattern", "name": "Call Pattern Analysis", "icon": "📈", "category": "telecom", "credits": 8, "status": "active", "description": "Detect calling anomalies"},
-    {"code": "tower_dump", "name": "Tower Dump Analysis", "icon": "📡", "category": "telecom", "credits": 15, "status": "active", "description": "Tower dump correlation"},
-    {"code": "contact_correlation", "name": "Contact Correlation", "icon": "🕸️", "category": "graph", "credits": 8, "status": "active", "description": "Find common contacts"},
-    {"code": "communication_analysis", "name": "Communication Analysis", "icon": "💬", "category": "telecom", "credits": 8, "status": "active", "description": "Communication graph and stats"},
-    {"code": "timeline_analysis", "name": "Timeline Analysis", "icon": "🕒", "category": "timeline", "credits": 5, "status": "active", "description": "Build investigation chronology"},
-    {"code": "geo_analysis", "name": "Geo Analysis", "icon": "🗺️", "category": "mapping", "credits": 8, "status": "active", "description": "Movement and location insights"},
+    {"code": "cdr_analysis", "name": "CDR Analysis", "icon": "📞", "category": "telecom", "credits": 10, "status": "upcoming", "description": "Analyze uploaded CDR CSV"},
+    {"code": "ipdr_analysis", "name": "IPDR Analysis", "icon": "📶", "category": "telecom", "credits": 10, "status": "upcoming", "description": "Analyze uploaded IPDR CSV"},
+    {"code": "bank_statement", "name": "Bank Statement Analysis", "icon": "🏦", "category": "financial", "credits": 15, "status": "upcoming", "description": "Transaction pattern analytics"},
+    {"code": "call_pattern", "name": "Call Pattern Analysis", "icon": "📈", "category": "telecom", "credits": 8, "status": "upcoming", "description": "Detect calling anomalies"},
+    {"code": "tower_dump", "name": "Tower Dump Analysis", "icon": "📡", "category": "telecom", "credits": 15, "status": "upcoming", "description": "Tower dump correlation"},
+    {"code": "contact_correlation", "name": "Contact Correlation", "icon": "🕸️", "category": "graph", "credits": 8, "status": "upcoming", "description": "Find common contacts"},
+    {"code": "communication_analysis", "name": "Communication Analysis", "icon": "💬", "category": "telecom", "credits": 8, "status": "upcoming", "description": "Communication graph and stats"},
+    {"code": "timeline_analysis", "name": "Timeline Analysis", "icon": "🕒", "category": "timeline", "credits": 5, "status": "upcoming", "description": "Build investigation chronology"},
+    {"code": "geo_analysis", "name": "Geo Analysis", "icon": "🗺️", "category": "mapping", "credits": 8, "status": "upcoming", "description": "Movement and location insights"},
 ]
 
 AI_COMMANDS = [
@@ -936,7 +944,9 @@ def user_login():
     if not user:
         conn.close()
         log_activity(None, "failed_login", f"Unknown identifier attempted login from {ip}: {identifier[:32]}")
-        return jsonify({"error": "User not found. Please register or wait for LEA approval."}), 404
+        # Same status/message as a wrong-password rejection below — a distinguishable
+        # response here would let an attacker enumerate which phone/email is registered.
+        return jsonify({"error": "Invalid credentials"}), 401
 
     # Lockout check
     limit = int(get_setting("user_failed_login_limit", os.getenv("FAILED_LOGIN_LIMIT", "5")))
@@ -1815,13 +1825,13 @@ def smtp_test():
 # PUBLIC USER/SERVICE APIs
 # ─────────────────────────────────────────────
 @app.route("/api/me", methods=["GET"])
+@user_required
 def get_current_user():
-    phone = request.args.get("phone")
-    if not phone:
-        return jsonify({"error": "phone required"}), 400
+    # Scoped to the caller's own session — any `phone` query param is ignored,
+    # so a logged-in user can't read another account by guessing its number.
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, phone, name, department, credits, status, plan_id FROM bot_users WHERE phone=%s", (phone,))
+    cursor.execute("SELECT id, phone, name, department, credits, status, plan_id FROM bot_users WHERE id=%s", (session.get("user_id"),))
     user = cursor.fetchone()
     conn.close()
     if not user:
@@ -1869,6 +1879,25 @@ def user_profile():
     if user.get("created_at"):
         user["created_at"] = user["created_at"].isoformat()
     return jsonify({"user": user, "twofa_mandatory": True})
+
+
+@app.route("/api/user/credit-history", methods=["GET"])
+@user_required
+def user_credit_history():
+    """The logged-in user's own credit_transactions — filtered by their own session
+    phone only, never a caller-supplied identifier, so there's no IDOR here."""
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT id, type, amount, reason, status, created_at FROM credit_transactions WHERE phone=%s ORDER BY created_at DESC LIMIT 100",
+        (session.get("user_phone"),),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return jsonify({"transactions": rows})
 
 
 @app.route("/api/user/password-change", methods=["POST"])
@@ -2057,13 +2086,17 @@ TOOL_CATEGORY_MAP = {
 }
 
 
-def charge_for_lookup(cursor, user, service, code, query, case_reference=""):
-    """Debit credits and write the audit trail for a lookup that returned data.
+def charge_for_lookup(cursor, user, service, code, query, case_reference="", found=True, source=""):
+    """Write the audit trail for a lookup, debiting credits only if it found data.
 
-    Called only once a result is in hand, so a miss is never billed. Returns the
-    number of credits actually charged.
+    Called with ``found=False`` on a miss: that an officer searched a number is
+    the compliance record whether or not anything came back, so the search_logs
+    row is always written — but a miss is never billed.
+
+    Returns ``(credits_charged, search_log_id)``. The id is what
+    ``/api/tools/run/report/pdf/<search_log_id>`` prints from.
     """
-    credits = lookup_cost(service)
+    credits = lookup_cost(service) if found else 0
     if credits:
         cursor.execute(
             "UPDATE bot_users SET credits = credits - %s WHERE id=%s AND credits >= %s",
@@ -2083,9 +2116,9 @@ def charge_for_lookup(cursor, user, service, code, query, case_reference=""):
         VALUES (%s,%s,%s,%s,%s,%s,%s)
         """,
         (user["id"], user["phone"], code, query[:255], case_reference[:100] or None,
-         credits, (service or {}).get("name") or code),
+         credits, source or (service or {}).get("name") or code),
     )
-    return credits
+    return credits, cursor.lastrowid
 
 
 class InsufficientCredits(Exception):
@@ -2170,7 +2203,8 @@ def run_tool_generic():
             row = cursor.fetchone()
             if row:
                 try:
-                    charged = charge_for_lookup(cursor, user, service, code, query, case_reference)
+                    charged, search_log_id = charge_for_lookup(
+                        cursor, user, service, code, query, case_reference, source="Subscriber Database")
                 except InsufficientCredits as exc:
                     conn.rollback(); conn.close()
                     return jsonify({
@@ -2184,21 +2218,23 @@ def run_tool_generic():
                     "success": True, "tool": code, "query": query,
                     "credits_charged": charged,
                     "credits_remaining": credits_available - charged,
+                    "search_log_id": search_log_id,
                     "results": [{"source": "Subscriber Database", "status": "ok", "data": _json_clean(row)}],
                 })
             # Fallback to generic uploaded records if old importer was used.
-            # Exact key only: the previous `data_json LIKE '%query%'` substring match
+            # Exact key only: the previous `data_json LIKE \'%query%\'` substring match
             # could bill for — and print a PDF from — an unrelated record that merely
             # contained the digits somewhere in its JSON.
             try:
-                cursor.execute("SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND record_key=%s ORDER BY created_at DESC LIMIT 20", (query,))
+                cursor.execute("SELECT * FROM master_data_records WHERE source_type IN (\'subscriber\',\'custom\') AND record_key=%s ORDER BY created_at DESC LIMIT 20", (query,))
                 rows = cursor.fetchall()
                 if rows:
                     for r in rows:
                         try: r["data"] = json.loads(r.get("data_json") or "{}")
                         except Exception: r["data"] = r.get("data_json")
                     try:
-                        charged = charge_for_lookup(cursor, user, service, code, query, case_reference)
+                        charged, search_log_id = charge_for_lookup(
+                            cursor, user, service, code, query, case_reference, source="Uploaded Master Data")
                     except InsufficientCredits as exc:
                         conn.rollback(); conn.close()
                         return jsonify({
@@ -2212,10 +2248,17 @@ def run_tool_generic():
                         "success": True, "tool": code, "query": query,
                         "credits_charged": charged,
                         "credits_remaining": credits_available - charged,
+                        "search_log_id": search_log_id,
                         "results": [{"source": "Uploaded Master Data", "status": "ok", "data": rows}],
                     })
             except mysql.connector.Error:
                 pass
+            # Neither source matched. The attempt is still recorded — that an officer
+            # searched a number is the compliance record, hit or miss — but nothing is
+            # charged for a miss.
+            charge_for_lookup(cursor, user, service, code, query, case_reference,
+                              found=False, source="No match")
+            conn.commit()
 
         if code == "vehicle_lookup":
             cursor.execute("SELECT * FROM vehicle_records WHERE registration_number=%s LIMIT 1", (query,))
@@ -2329,6 +2372,122 @@ def run_tool_generic():
     return jsonify({"success": False, "error": f"No working connector/data found for tool '{code}'. Configure API dependency or upload database.", "errors": errors}), 400
 
 
+SUBSCRIBER_REPORT_FIELDS = [
+    ("mobile_number", "Mobile Number"),
+    ("subscriber_name", "Subscriber Name"),
+    ("father_name", "Father's Name"),
+    ("address", "Address"),
+    ("district", "District"),
+    ("state", "State"),
+    ("operator", "Operator"),
+    ("sim_type", "SIM Type"),
+    ("activation_date", "Activation Date"),
+    ("status", "Status"),
+    ("alternate_number", "Alternate Number"),
+    ("email", "Email"),
+    ("id_type", "ID Type"),
+    ("id_number", "ID Number"),
+]
+
+
+def _build_mobile_lookup_pdf(log: dict, record: dict) -> bytes:
+    """Render a search_logs row + its subscriber record as a PDF report."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("SentinelTitle", parent=styles["Title"], fontSize=18, textColor=colors.HexColor("#0e1a29"))
+    meta_style = ParagraphStyle("SentinelMeta", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#444444"), leading=13)
+    footer_style = ParagraphStyle("SentinelFooter", parent=styles["Normal"], fontSize=7.5, textColor=colors.HexColor("#777777"))
+
+    app_name = get_setting("app_name", "SENTINEL")
+    disclaimer = get_setting("login_notice", "Restricted access only. For authorized law-enforcement use.")
+
+    created_at = log.get("created_at")
+    created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_at, "strftime") else str(created_at or "")
+
+    story = [
+        Paragraph(f"{app_name} — Mobile Lookup Report", title_style),
+        Spacer(1, 4 * mm),
+        Paragraph(
+            f"Case Reference: {log.get('case_reference') or '—'}<br/>"
+            f"Search Log ID: {log.get('id')}<br/>"
+            f"Queried Number: {log.get('query_value')}<br/>"
+            f"Searched At: {created_at_str}<br/>"
+            f"Source: {log.get('sources_queried') or '—'}<br/>"
+            f"Requested By: {session.get('user_name', 'Operator')} ({session.get('user_department') or '—'})",
+            meta_style,
+        ),
+        Spacer(1, 6 * mm),
+    ]
+
+    table_data = [["Field", "Value"]]
+    for key, label in SUBSCRIBER_REPORT_FIELDS:
+        value = record.get(key)
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        table_data.append([label, str(value) if value not in (None, "") else "—"])
+
+    table = Table(table_data, colWidths=[50 * mm, 110 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e1a29")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f7fa")]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 10 * mm))
+    story.append(Paragraph(disclaimer, footer_style))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+@app.route("/api/tools/run/report/pdf/<int:search_log_id>", methods=["GET"])
+@user_required
+def mobile_lookup_report_pdf(search_log_id):
+    """Re-format an already-paid-for mobile_lookup search as a PDF. No new credit charge,
+    no new search_logs row — this reads back a prior search, scoped to the caller."""
+    user_id = session.get("user_id")
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM search_logs WHERE id=%s AND user_id=%s", (search_log_id, user_id))
+    log = cursor.fetchone()
+    if not log:
+        conn.close()
+        return jsonify({"error": "Report not found."}), 404
+    if not log.get("credits_used") or (log.get("sources_queried") or "").strip().lower() == "no match":
+        conn.close()
+        return jsonify({"error": "No successful search found for this record — nothing to report."}), 400
+
+    query_value = log.get("query_value") or ""
+    cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query_value,))
+    record = cursor.fetchone()
+    if not record:
+        cursor.execute(
+            "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND (record_key=%s OR data_json LIKE %s) ORDER BY created_at DESC LIMIT 1",
+            (query_value, f"%{query_value}%"),
+        )
+        fallback = cursor.fetchone()
+        if fallback:
+            try:
+                record = json.loads(fallback.get("data_json") or "{}")
+            except Exception:
+                record = {}
+    conn.close()
+    if not record:
+        return jsonify({"error": "Underlying subscriber record no longer exists."}), 404
+
+    pdf_bytes = _build_mobile_lookup_pdf(log, record)
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=sentinel_mobile_lookup_{search_log_id}.pdf"},
+    )
 
 
 # ─────────────────────────────────────────────
@@ -2818,10 +2977,18 @@ def log_service_usage_internal(phone, service_code, case_reference, input_summar
             if not service or not user:
                 return
             is_free = bool(service["is_free"])
-            credits_charged = 0 if is_free else int(service["credits_per_use"])
-            if credits_charged and user["credits"] >= credits_charged:
-                cursor.execute("UPDATE bot_users SET credits=credits-%s WHERE id=%s", (credits_charged, user["id"]))
-                cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'debit',%s,%s)", (phone, credits_charged, f"service:{service_code}"))
+            credits_required = 0 if is_free else int(service["credits_per_use"])
+            credits_charged = 0
+            if credits_required:
+                # Atomic check-and-deduct — mirrors run_tool_generic()'s guard so two
+                # concurrent CDR/IPDR requests can't both pass a stale balance check.
+                cursor.execute(
+                    "UPDATE bot_users SET credits = credits - %s WHERE id = %s AND credits >= %s",
+                    (credits_required, user["id"], credits_required),
+                )
+                if cursor.rowcount:
+                    credits_charged = credits_required
+                    cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,'debit',%s,%s)", (phone, credits_charged, f"service:{service_code}"))
             cursor.execute(
                 "INSERT INTO service_usage_log (user_id, service_id, case_reference, input_summary, credits_charged) VALUES (%s,%s,%s,%s,%s)",
                 (user["id"], service["id"], case_reference, input_summary, credits_charged),
@@ -3018,6 +3185,7 @@ def import_batches_v2():
     return jsonify(rows)
 
 @app.route('/api/analysis/workspace/<int:batch_id>', methods=['GET'])
+@admin_required
 def analysis_workspace_v2(batch_id):
     conn = get_db()
     cur = conn.cursor(dictionary=True)
@@ -3205,6 +3373,7 @@ def analysis_workspace_v2(batch_id):
 
 
 @app.route('/workspace/<int:batch_id>')
+@admin_required
 def workspace_page(batch_id):
     return render_template('workspace.html', batch_id=batch_id)
 
