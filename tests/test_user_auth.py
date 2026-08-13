@@ -183,7 +183,9 @@ class UserAuthTests(unittest.TestCase):
 
     def test_logout_clears_session(self):
         self.client.post("/api/user/login", json={"identifier": "9999999999", "password": "CorrectHorse123!"})
-        logout_resp = self.client.post("/api/user/logout")
+        with self.client.session_transaction() as sess:
+            csrf_token = sess["csrf_token"]
+        logout_resp = self.client.post("/api/user/logout", headers={"X-CSRF-Token": csrf_token})
         self.assertEqual(logout_resp.status_code, 200)
         session_resp = self.client.get("/api/user/session")
         self.assertEqual(session_resp.status_code, 401)

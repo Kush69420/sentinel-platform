@@ -102,9 +102,32 @@ remarks,text,0,0"></textarea></div><button class="btn green" onclick="createCust
 <section class="page" id="page-activity"><div class="panel"><div class="panel-head">ACTIVITY LOGS <button class="btn" onclick="loadActivity()">Refresh</button></div><div class="panel-body table-wrap"><table><thead><tr><th>Time</th><th>Admin</th><th>Action</th><th>Description</th></tr></thead><tbody id="activityBody"></tbody></table></div></div></section>
 </main></div><div class="toast" id="toast"></div>
 <script>
+/* CSRF (Day 2): every POST/PUT/DELETE on an authenticated session must carry
+   the session's token in X-CSRF-Token — see _enforce_csrf() in app.py. Wrapping
+   fetch here means every call site below gets it automatically instead of each
+   of them needing to know about CSRF. */
+(function(){
+  let csrfToken=null,csrfPromise=null;
+  function ensureCsrfToken(){
+    if(csrfToken)return Promise.resolve(csrfToken);
+    if(!csrfPromise){csrfPromise=fetch('/api/csrf-token',{credentials:'same-origin'}).then(r=>r.ok?r.json():null).then(d=>{csrfToken=(d&&d.csrf_token)||null;csrfPromise=null;return csrfToken}).catch(()=>{csrfPromise=null;return null})}
+    return csrfPromise;
+  }
+  window.setCsrfToken=function(t){if(t)csrfToken=t};
+  const nativeFetch=window.fetch.bind(window);
+  window.fetch=async function(input,init){
+    init=init||{};
+    const method=(init.method||'GET').toUpperCase();
+    if(method==='POST'||method==='PUT'||method==='DELETE'||method==='PATCH'){
+      const token=await ensureCsrfToken();
+      if(token)init.headers=Object.assign({},init.headers,{'X-CSRF-Token':token});
+    }
+    return nativeFetch(input,init);
+  };
+})();
 let sessionRemaining=3600,inactivityLimit=900,inactivityRemaining=900;const settingIds=['app_name','support_whatsapp','session_timeout_min','inactivity_timeout_min','failed_login_limit','lockout_hours','new_user_free_credits','low_credit_threshold','login_title','login_notice','allowed_email_domains'];
 function toastMsg(m,type){toast.textContent=m;toast.className='toast'+(type==='error'?' error':'');toast.style.display='block';clearTimeout(window.tt);window.tt=setTimeout(()=>toast.style.display='none',3000)}
-async function doLogin(){lockMsg.textContent='';const r=await fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:loginUser.value,password:loginPass.value,otp:loginOtp.value})}).catch(()=>null);if(!r){toastMsg('Backend not reachable','error');return}const d=await r.json();if(r.ok){loginPage.style.display='none';shell.style.display='grid';toastMsg('Welcome '+d.name);init();return}if(d.twofa_required){otpField.style.display='block';lockMsg.textContent='2FA required';return}if(d.locked){lockMsg.textContent='Account locked. Try again later.';return}toastMsg(d.error||'Login failed','error')}
+async function doLogin(){lockMsg.textContent='';const r=await fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:loginUser.value,password:loginPass.value,otp:loginOtp.value})}).catch(()=>null);if(!r){toastMsg('Backend not reachable','error');return}const d=await r.json();if(r.ok){setCsrfToken(d.csrf_token);loginPage.style.display='none';shell.style.display='grid';toastMsg('Welcome '+d.name);init();return}if(d.twofa_required){otpField.style.display='block';lockMsg.textContent='2FA required';return}if(d.locked){lockMsg.textContent='Account locked. Try again later.';return}toastMsg(d.error||'Login failed','error')}
 async function doLogout(){try{await fetch('/api/admin/logout',{method:'POST'})}catch(e){}location.reload()}
 function showPage(id,el){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));document.getElementById('page-'+id).classList.add('active');if(el)el.classList.add('active');pageTitle.textContent={dashboard:'⬡ DASHBOARD',custom:'🎛️ APP CUSTOMIZATION',frontend:'🎨 FRONTEND CONTENT',verification:'🪪 LEA VERIFICATION',users:'👥 USER MANAGEMENT',billing:'💳 PLANS & PAYMENTS',cases:'📁 CASE MANAGEMENT',services:'🧰 SERVICES & CREDITS',data:'🗄️ DATA UPLOAD',api:'🔌 API MANAGEMENT',ai:'🤖 AI INTEGRATION',smtp:'✉️ SMTP / EMAIL',security:'🔒 SECURITY',activity:'◷ ACTIVITY LOGS'}[id]||id.toUpperCase();nav.classList.remove('open');({custom:loadSettings,frontend:loadFrontend,verification:loadVerification,users:loadUsers,billing:loadBilling,cases:loadCases,services:loadServices,data:loadImportCenter,api:loadApis,ai:loadAI,smtp:loadSMTP,activity:loadActivity}[id]||(()=>{}))()}
 

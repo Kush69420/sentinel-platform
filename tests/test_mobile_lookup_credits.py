@@ -141,15 +141,23 @@ class MobileLookupCreditTests(unittest.TestCase):
     def tearDown(self):
         self.get_db_patch.stop()
 
+    CSRF_TOKEN = "test-csrf-token"
+    CSRF_HEADERS = {"X-CSRF-Token": CSRF_TOKEN}
+
     def _login(self, user_id=1, phone="9999999999"):
         with self.client.session_transaction() as sess:
             sess["is_user"] = True
             sess["user_id"] = user_id
             sess["user_phone"] = phone
+            # CSRF enforcement (Day 2) checks a session-stored token against the
+            # X-CSRF-Token header on every state-changing request once a session
+            # is authenticated. This helper bypasses the real login flow (which
+            # is what mints that token), so it must set one directly.
+            sess["csrf_token"] = self.CSRF_TOKEN
 
     def test_successful_lookup_deducts_credit_and_logs_audit_row(self):
         self._login(user_id=1, phone="9999999999")
-        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9876543210", "case_reference": "FIR-2026-1182"})
+        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9876543210", "case_reference": "FIR-2026-1182"}, headers=self.CSRF_HEADERS)
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertTrue(body["success"])
@@ -166,7 +174,7 @@ class MobileLookupCreditTests(unittest.TestCase):
 
     def test_insufficient_credits_blocks_before_running_query(self):
         self._login(user_id=2, phone="8888888888")  # only 1 credit, needs 2
-        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9876543210"})
+        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9876543210"}, headers=self.CSRF_HEADERS)
         self.assertEqual(resp.status_code, 402)
         self.assertEqual(self.db["bot_users"][2]["credits"], 1)  # untouched
         self.assertEqual(self.db["credit_transactions"], [])
@@ -174,7 +182,7 @@ class MobileLookupCreditTests(unittest.TestCase):
 
     def test_no_match_is_logged_but_not_charged(self):
         self._login(user_id=1, phone="9999999999")
-        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000"})
+        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000"}, headers=self.CSRF_HEADERS)
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(self.db["bot_users"][1]["credits"], 5)  # untouched
         self.assertEqual(self.db["credit_transactions"], [])
@@ -196,7 +204,7 @@ class MobileLookupCreditTests(unittest.TestCase):
             return real_execute(cursor_self, query, params)
 
         with mock.patch.object(FakeCursor, "execute", draining_execute):
-            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9876543210"})
+            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9876543210"}, headers=self.CSRF_HEADERS)
         self.assertEqual(resp.status_code, 402)
         self.assertEqual(self.db["bot_users"][1]["credits"], 0)
         self.assertEqual(self.db["credit_transactions"], [])

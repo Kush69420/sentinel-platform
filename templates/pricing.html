@@ -42,6 +42,27 @@ h1{text-align:center;font-family:var(--mono);letter-spacing:4px;font-size:26px;m
   <div class="note" id="providerNote"></div>
 </div>
 <script>
+/* CSRF (Day 2): /api/payments/checkout is @user_required, so a signed-in
+   visitor here needs the header too — see _enforce_csrf() in app.py. */
+(function(){
+  let csrfToken=null,csrfPromise=null;
+  function ensureCsrfToken(){
+    if(csrfToken)return Promise.resolve(csrfToken);
+    if(!csrfPromise){csrfPromise=fetch('/api/csrf-token',{credentials:'same-origin'}).then(r=>r.ok?r.json():null).then(d=>{csrfToken=(d&&d.csrf_token)||null;csrfPromise=null;return csrfToken}).catch(()=>{csrfPromise=null;return null})}
+    return csrfPromise;
+  }
+  window.setCsrfToken=function(t){if(t)csrfToken=t};
+  const nativeFetch=window.fetch.bind(window);
+  window.fetch=async function(input,init){
+    init=init||{};
+    const method=(init.method||'GET').toUpperCase();
+    if(method==='POST'||method==='PUT'||method==='DELETE'||method==='PATCH'){
+      const token=await ensureCsrfToken();
+      if(token)init.headers=Object.assign({},init.headers,{'X-CSRF-Token':token});
+    }
+    return nativeFetch(input,init);
+  };
+})();
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
 const grid=document.getElementById('grid'),msg=document.getElementById('msg'),note=document.getElementById('providerNote');
 let signedIn=false;

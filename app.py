@@ -276,6 +276,63 @@ def role_required(*roles):
 
 
 # ─────────────────────────────────────────────
+# CSRF PROTECTION (lightweight double-submit token)
+#
+# No CSRF protection existed anywhere before this: every session-authenticated
+# state-changing endpoint was forgeable by a page the victim's browser merely
+# visited while logged in — the browser attaches the session cookie
+# automatically to a cross-site request, and Flask's default session config
+# has no SameSite restriction to stop that.
+#
+# A random token is minted into the server-side session at login (both user
+# and admin, see user_login()/admin_login()) and the frontend must echo it
+# back in the X-CSRF-Token header on every state-changing request. An
+# attacker's cross-site form/fetch carries the victim's cookies but cannot
+# read anything out of the victim's session (same-origin policy), so it has
+# no way to reproduce the header.
+#
+# Deliberately scoped to *authenticated* requests only: unauthenticated
+# POSTs (signup, login itself, password-reset request/confirm) have no
+# session to protect yet, and standing up a pre-session anonymous CSRF
+# cookie is unneeded complexity for this threat model — the sensitive,
+# side-effecting actions are all behind @user_required/@admin_required.
+# ─────────────────────────────────────────────
+CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _new_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+@app.before_request
+def _enforce_csrf():
+    if request.method in CSRF_SAFE_METHODS:
+        return None
+    if not (session.get("is_user") or session.get("is_admin")):
+        return None  # no authenticated session to forge yet
+    expected = session.get("csrf_token")
+    provided = request.headers.get("X-CSRF-Token", "")
+    if not expected or not provided or not hmac.compare_digest(str(expected), provided):
+        return jsonify({"error": "CSRF token missing or invalid. Refresh the page and try again."}), 403
+    return None
+
+
+@app.route("/api/csrf-token", methods=["GET"])
+def csrf_token_endpoint():
+    """Issue (or return the existing) CSRF token for the current session.
+
+    Only meaningful once a session is authenticated — there is nothing to
+    protect before that, and the frontend fetch wrapper only needs a token
+    once it starts issuing POST/PUT/DELETE calls.
+    """
+    if not (session.get("is_user") or session.get("is_admin")):
+        return jsonify({"error": "Authentication required"}), 401
+    if not session.get("csrf_token"):
+        session["csrf_token"] = _new_csrf_token()
+    return jsonify({"csrf_token": session["csrf_token"]})
+
+
+# ─────────────────────────────────────────────
 # ACCOUNT STATE vs DATA CLEARANCE
 #
 # These are two orthogonal facts and are deliberately kept in two columns:
@@ -908,9 +965,11 @@ def user_signup():
     session["user_name"] = name
     session["user_department"] = ""
     session["user_login_at"] = datetime.utcnow().isoformat()
+    session["csrf_token"] = _new_csrf_token()
 
     return jsonify({
         "success": True,
+        "csrf_token": session["csrf_token"],
         "redirect": "/dashboard",
         "user": {
             "id": user_id,
@@ -1053,11 +1112,13 @@ def user_login():
     session["user_name"] = user.get("name") or "Operator"
     session["user_department"] = user.get("department") or ""
     session["user_login_at"] = datetime.utcnow().isoformat()
+    session["csrf_token"] = _new_csrf_token()
 
     log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}")
 
     return jsonify({
         "success": True,
+        "csrf_token": session["csrf_token"],
         "redirect": "/dashboard",
         "user": {
             "id": user["id"],
@@ -1269,8 +1330,15 @@ def admin_login():
     session["admin_name"] = admin["name"]
     session["admin_role"] = admin["role"]
     session["login_at"] = datetime.utcnow().isoformat()
+    session["csrf_token"] = _new_csrf_token()
     log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()}")
-    return jsonify({"success": True, "name": admin["name"], "role": admin["role"], "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60"))})
+    return jsonify({
+        "success": True,
+        "name": admin["name"],
+        "role": admin["role"],
+        "csrf_token": session["csrf_token"],
+        "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60")),
+    })
 
 
 @app.route("/api/admin/logout", methods=["POST"])
