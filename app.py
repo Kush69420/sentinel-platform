@@ -1297,6 +1297,7 @@ def user_password_reset_confirm():
 # ADMIN AUTH + SECURITY
 # ─────────────────────────────────────────────
 @app.route("/api/admin/login", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP — same shape as user login
 def admin_login():
     data = request.json or {}
     username = data.get("username", "").strip()
