@@ -34,6 +34,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from xml.sax.saxutils import escape as xml_escape
 
 import mysql.connector
 import pyotp
@@ -2568,22 +2569,37 @@ def _build_mobile_lookup_pdf(log: dict, record: dict) -> bytes:
     meta_style = ParagraphStyle("SentinelMeta", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#444444"), leading=13)
     footer_style = ParagraphStyle("SentinelFooter", parent=styles["Normal"], fontSize=7.5, textColor=colors.HexColor("#777777"))
 
-    app_name = get_setting("app_name", "SENTINEL")
-    disclaimer = get_setting("login_notice", "Restricted access only. For authorized law-enforcement use.")
+    # reportlab's Paragraph parses a mini XML-like markup (it's what makes <br/>
+    # below work), so anything interpolated into one must be escaped first or a
+    # value containing '<'/'&' can break rendering or inject unintended markup.
+    # case_reference/query_value/sources_queried come from search_logs (user
+    # input at search time); user_name/user_department come from the session,
+    # itself seeded from the signup form. app_name/disclaimer are admin-set via
+    # get_setting() — lower risk, but escaped too for consistency since nothing
+    # here is meant to carry real markup.
+    app_name = xml_escape(str(get_setting("app_name", "SENTINEL")))
+    disclaimer = xml_escape(str(get_setting("login_notice", "Restricted access only. For authorized law-enforcement use.")))
 
     created_at = log.get("created_at")
     created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_at, "strftime") else str(created_at or "")
+
+    case_reference = xml_escape(str(log.get("case_reference") or "—"))
+    search_log_id = xml_escape(str(log.get("id")))
+    query_value = xml_escape(str(log.get("query_value") or ""))
+    sources_queried = xml_escape(str(log.get("sources_queried") or "—"))
+    requested_by_name = xml_escape(str(session.get("user_name", "Operator")))
+    requested_by_dept = xml_escape(str(session.get("user_department") or "—"))
 
     story = [
         Paragraph(f"{app_name} — Mobile Lookup Report", title_style),
         Spacer(1, 4 * mm),
         Paragraph(
-            f"Case Reference: {log.get('case_reference') or '—'}<br/>"
-            f"Search Log ID: {log.get('id')}<br/>"
-            f"Queried Number: {log.get('query_value')}<br/>"
+            f"Case Reference: {case_reference}<br/>"
+            f"Search Log ID: {search_log_id}<br/>"
+            f"Queried Number: {query_value}<br/>"
             f"Searched At: {created_at_str}<br/>"
-            f"Source: {log.get('sources_queried') or '—'}<br/>"
-            f"Requested By: {session.get('user_name', 'Operator')} ({session.get('user_department') or '—'})",
+            f"Source: {sources_queried}<br/>"
+            f"Requested By: {requested_by_name} ({requested_by_dept})",
             meta_style,
         ),
         Spacer(1, 6 * mm),

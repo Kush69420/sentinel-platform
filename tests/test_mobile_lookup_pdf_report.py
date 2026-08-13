@@ -153,5 +153,62 @@ class MobileLookupPdfReportTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class PdfInjectionTest(unittest.TestCase):
+    """Day 2 (g) — case_reference/query_value/sources_queried (search_logs,
+    user-supplied at search time) and session user_name/user_department
+    (from the signup form) were interpolated raw into a reportlab.Paragraph,
+    which parses a mini XML-like markup. A value containing an unescaped '<'
+    doesn't just render oddly — reportlab's paraparser raises on anything
+    that looks like a malformed/unrecognized tag, which would 500 the whole
+    report endpoint. Confirmed against reportlab directly: building a
+    Paragraph from '<img src=x onerror=alert(1)>' raises
+    ValueError('...invalid attribute name onerror...'); the same string run
+    through xml.sax.saxutils.escape() first builds cleanly.
+    """
+
+    INJECTION_PAYLOAD = "FIR-<img src=x onerror=alert(1)> <b>bold</b> & <unclosed"
+
+    def setUp(self):
+        import app as app_module
+        self.app_module = app_module
+        self.db = make_db()
+        self.db["search_logs"][1]["case_reference"] = self.INJECTION_PAYLOAD
+        self.db["search_logs"][1]["sources_queried"] = "Subscriber DB <script>alert(1)</script>"
+        self.fake_conn = FakeConn(self.db)
+        self.get_db_patch = mock.patch.object(app_module, "get_db", return_value=self.fake_conn)
+        self.get_db_patch.start()
+        app_module.app.config["TESTING"] = True
+        self.client = app_module.app.test_client()
+
+    def tearDown(self):
+        self.get_db_patch.stop()
+
+    def _login(self, user_id=1):
+        with self.client.session_transaction() as sess:
+            sess["is_user"] = True
+            sess["user_id"] = user_id
+            # Session fields are also interpolated raw into the same Paragraph.
+            sess["user_name"] = "Operator <img src=x onerror=alert(2)>"
+            sess["user_department"] = "Cyber Cell & <b>Ops</b>"
+
+    def test_malicious_case_reference_does_not_break_report_generation(self):
+        """Before escaping, this payload crashes reportlab's paraparser and
+        the endpoint would 500 instead of returning a report."""
+        self._login(user_id=1)
+        resp = self.client.get("/api/tools/run/report/pdf/1")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data.startswith(b"%PDF"))
+
+    def test_build_function_directly_does_not_raise(self):
+        log = dict(self.db["search_logs"][1])
+        record = dict(self.db["subscriber_records"]["9876543210"])
+        with self.app_module.app.test_request_context():
+            from flask import session as flask_session
+            flask_session["user_name"] = "Operator <img src=x onerror=alert(2)>"
+            flask_session["user_department"] = "Cyber Cell & <b>Ops</b>"
+            pdf_bytes = self.app_module._build_mobile_lookup_pdf(log, record)
+        self.assertTrue(pdf_bytes.startswith(b"%PDF"))
+
+
 if __name__ == "__main__":
     unittest.main()
