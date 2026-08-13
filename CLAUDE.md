@@ -37,11 +37,29 @@ Do these in order once the database server is provisioned:
    and stored API keys. If it is lost or regenerated, every encrypted value becomes
    permanently unrecoverable.
 
-Still open and *not* covered by the above: Day 2 security debt (CSRF, security headers,
-`admin`/`admin123` seed, `role_required` rollout, fail-fast on missing secrets) and Day 5
-packaging. `app.run(debug=True, host="0.0.0.0")` is still the only way to start the app —
-the Werkzeug interactive debugger is remote code execution, so **do not expose this
-as-is**.
+5. **Read `DAY2_HANDOVER.md` before deploying.** Day 2 (fail-fast secrets, CSRF, session
+   cookie hardening + security headers, admin login rate limit, upload/SSE hardening, PDF
+   injection escaping) is complete in code on `day2-security` — see that file for what
+   changed and, most importantly, the two things it did **not** do that affect the
+   deploy steps above: `FLASK_ENV` now gates startup (step 2's `.env` keys are no longer
+   optional in the way they used to be — see below) and `SESSION_COOKIE_SECURE` defaults
+   to `True`, which will silently drop the session cookie if the app is ever reached
+   over plain HTTP outside `FLASK_ENV=development`.
+
+   **This changes step 2 above from "copy these in" to "these are now load-bearing":**
+   outside `FLASK_ENV=development`, `app.py` now **refuses to start** (raises at import)
+   if `SECRET_KEY` or `ENCRYPTION_KEY` is unset — the old silent-fallback/regenerate-at-
+   restart behavior only remains for local dev. Set `FLASK_ENV=production` (or leave it
+   unset — an unset value is treated as production-like) plus real `SECRET_KEY` and
+   `ENCRYPTION_KEY` values before the app will boot at all.
+
+Still open and *not* covered by the above: `admin`/`admin123` seed + `role_required`
+rollout (intentionally deferred together, see the Decision note below — now tied to a
+planned OAuth2 implementation), the CLI-execution-endpoint RBAC gap, and Day 5 packaging.
+`app.run(debug=True, host="0.0.0.0")` is still the only way to start the app — the
+Werkzeug interactive debugger is remote code execution, so **do not expose this as-is**.
+The in-process rate limiter (`_rate_limiter` in `app.py`) also has a real deployment
+caveat that isn't a bug to fix — see "Known Issues" below.
 
 ## Reminder (2026-08-10)
 
@@ -52,11 +70,28 @@ workspace endpoint (both now require `@admin_required`). Only the hardcoded
 default admin credential remains open, and it's intentionally deferred (see
 Decision below), not forgotten.
 
-**Decision (2026-08-10):** the hardcoded default admin credential item is
-intentionally deferred, not skipped. It will be fixed together with RBAC
-enforcement (the `role_required(*roles)` High item) as one pass, done right
-before deployment rather than now — forcing rotation/seed removal ahead of
-having roles enforced would just mean redoing the admin-bootstrap flow twice.
+**Decision (2026-08-10, updated 2026-08-14):** the hardcoded default admin
+credential item is intentionally deferred, not skipped. It will be fixed
+together with RBAC enforcement (the `role_required(*roles)` High item) as
+one pass, done right before deployment rather than now — forcing
+rotation/seed removal ahead of having roles enforced would just mean redoing
+the admin-bootstrap flow twice. As of 2026-08-14 this pass is specifically
+tied to a planned OAuth2 implementation: RBAC will be designed on top of
+whatever role/claims model OAuth2 brings in, not bolted onto the current
+session-based `admin_users.role` column. Concretely, that means don't apply
+`@role_required` anywhere, don't touch the `admin_users` seed in
+`db_setup.sql`, and don't gate `/api/admin/tools/<id>/cli-test` by role as a
+one-off ahead of that pass — it will be redone once OAuth2 lands anyway.
+
+**Reminder (2026-08-14):** Day 2 of the 5-day security hardening plan is
+complete on `day2-security` (fail-fast secrets, CSRF protection, session
+cookie hardening + security headers, `/api/admin/login` rate limit,
+`/uploads` path-traversal guard, `/api/events` auth + bounded connections,
+PDF injection escaping — see `DAY2_HANDOVER.md`). Everything in the Critical/
+High/Medium/Low lists below that Day 2 touched is marked fixed inline; the
+RBAC-adjacent items (admin seed, `role_required` rollout, CLI-endpoint RBAC
+gap) are unchanged and still deferred per the Decision above. `app.run(debug=
+True, host="0.0.0.0")` is unchanged — still Day 5 packaging scope.
 
 ## Known Issues / Security Debt (pre-existing, not yet patched)
 
@@ -87,50 +122,86 @@ fixes already shipped — those are done.
 
 ### High
 
-- **No CSRF protection anywhere** — no tokens, no `SameSite` cookie config.
-  Every session-authenticated state-changing endpoint is forgeable by a page
-  the victim's browser visits while logged in.
+- ~~No CSRF protection anywhere~~ — **FIXED in `day2-security`.** A lightweight
+  double-submit token is minted into the session at login and required (via
+  a `before_request` hook) in the `X-CSRF-Token` header on every
+  POST/PUT/DELETE once a session is authenticated. See `DAY2_HANDOVER.md`.
 - **RBAC modeled but never enforced** — `admin_users.role` is
   `ENUM('super_admin','manager','support')` and a `role_required(*roles)`
   decorator exists (`app.py`) but is never applied to any route. Every admin,
   regardless of role, gets full `@admin_required` super-admin power.
+  **Deferred, tied to a planned OAuth2 implementation** — see the Decision
+  note above. Not touched by Day 2, deliberately.
 - **CLI execution endpoint = admin-to-RCE** (`/api/admin/tools/<id>/cli-test`,
   `app.py`) — any admin (not just `super_admin`, per the RBAC gap above) can
   run arbitrary shell commands via admin-configured `external_command`
   templates. `{query}` is substituted before `shlex.split`, so not
   shell-metacharacter injectable, but is argument-injectable into whatever
-  binary is configured.
+  binary is configured. Same deferral as RBAC above — not touched by Day 2.
 - **`app.run(debug=True, host="0.0.0.0", port=5000)`** — Werkzeug's
-  interactive debugger is RCE if reachable; bound to all interfaces.
-- **Insecure fallback `SECRET_KEY`**: `os.getenv("SECRET_KEY",
-  "dev_secret_change_this")`. If unset in prod, session cookies (including
-  `is_admin=True`) are forgeable.
+  interactive debugger is RCE if reachable; bound to all interfaces. Day 5
+  packaging scope, not touched by Day 2.
+- ~~Insecure fallback `SECRET_KEY`~~ — **FIXED in `day2-security`.** Outside
+  `FLASK_ENV=development`, a missing `SECRET_KEY` (or `ENCRYPTION_KEY`) now
+  raises at startup instead of silently falling back. See `DAY2_HANDOVER.md`.
 
 ### Medium
 
-- No rate limiting on `/api/admin/login` (unlike `/api/user/login`). The
-  3-attempt lockout also doubles as a DoS lever against the real admin.
-- No security headers anywhere (no CSP, `X-Frame-Options`,
-  `X-Content-Type-Options`, HSTS).
-- Session cookie not hardened — no `SESSION_COOKIE_SECURE` /
-  `SESSION_COOKIE_SAMESITE` set, so Flask's insecure defaults apply.
+- ~~No rate limiting on `/api/admin/login`~~ — **FIXED in `day2-security`.**
+  Same IP-scoped `@rate_limit` shape as `/api/user/login`, ahead of the
+  existing account lockout (which stays as the outer safety net).
+- ~~No security headers anywhere~~ — **FIXED in `day2-security`.** A new
+  `after_request` hook sets CSP, `X-Frame-Options: DENY`,
+  `X-Content-Type-Options: nosniff`, and HSTS (outside dev, HTTPS only). The
+  CSP still allows `'unsafe-inline'` for script-src/style-src — see
+  `DAY2_HANDOVER.md` for why that's a deliberate follow-up, not an oversight.
+- ~~Session cookie not hardened~~ — **FIXED in `day2-security`.**
+  `SESSION_COOKIE_HTTPONLY=True`, `SESSION_COOKIE_SAMESITE="Lax"` always;
+  `SESSION_COOKIE_SECURE` defaults `True`, relaxed only under
+  `FLASK_ENV=development`.
 - ~~Backdoor dev password (`app.py`, `user_password_change()`)~~ — **FIXED in
   `day1-selfserve-auth`.** Both the login and password-change fallbacks are gone
   and `DEV_USER_PASSWORD` has been removed from `app.py` and `.env`. An account
   with no `password_hash` now fails closed and needs an admin-issued reset code.
-- Ephemeral encryption key: if `ENCRYPTION_KEY` isn't in `.env`, a new Fernet
-  key is generated *every restart*, permanently bricking previously
-  encrypted gov-ID uploads, 2FA secrets, integration API keys, SMTP
-  passwords.
+- ~~Ephemeral encryption key~~ — **FIXED in `day2-security`** (same fail-fast
+  change as `SECRET_KEY` above): outside dev, a missing `ENCRYPTION_KEY` now
+  refuses to start rather than silently generating a throwaway one.
+- ~~PDF report injection~~ — **FIXED in `day2-security`.** Not part of the
+  2026-08-09 sweep below (found separately during Day 2 planning).
+  `_build_mobile_lookup_pdf()` interpolated `case_reference`/`query_value`/
+  `sources_queried` (user input via `search_logs`) and session
+  `user_name`/`user_department` raw into a `reportlab.Paragraph`, which
+  parses XML-like markup — a value that looked like a malformed tag (e.g.
+  `<img src=x onerror=alert(1)>`) crashed report generation with a
+  `ValueError` (confirmed directly against reportlab), not just rendered
+  oddly. All five fields (plus `app_name`/`disclaimer`, admin-controlled,
+  escaped for consistency) now go through `xml.sax.saxutils.escape()` first.
+- **In-process rate limiter has no shared store (documented, not fixed).**
+  `_rate_limiter` in `app.py` (backing the `rate_limit()` decorator used on
+  login, signup, LEA registration, mobile lookup, etc.) is a plain
+  in-memory, per-process sliding window. Under gunicorn (or any multi-worker
+  server) each worker process gets its **own** counter, so the effective
+  limit is `configured_limit × worker_count`, and every counter resets on
+  each deploy/restart. There is no `Procfile`/gunicorn config in this repo
+  yet (Day 5 packaging), so this hasn't bitten anyone in practice, but it
+  will the moment the app runs with more than one worker. Fixing it means a
+  shared store (Redis, or the database) behind the same `rate_limit()`
+  interface — deliberately out of scope for Day 2 (see `DAY2_HANDOVER.md`);
+  do not add Redis or any shared store without this being scoped as its own
+  piece of work.
 
 ### Low
 
-- `/uploads/<filename>` builds the filesystem path directly from the URL
-  segment — admin-only, but no `secure_filename`/basename guard as
-  defense-in-depth.
-- `/api/events` is an unauthenticated SSE endpoint with an infinite
-  per-connection generator loop — connection-exhaustion DoS vector, no data
-  exposure.
+- ~~`/uploads/<filename>` builds the filesystem path directly from the URL
+  segment~~ — **FIXED in `day2-security`.** Now runs the filename through
+  `secure_filename()` before joining it onto `UPLOAD_FOLDER`, same as the
+  write path already did.
+- ~~`/api/events` is an unauthenticated SSE endpoint with an infinite
+  per-connection generator loop~~ — **FIXED in `day2-security`.** Now
+  requires a session (`session_required`: either `is_user` or `is_admin` —
+  the payload is an identical content-free sync ping either way) and each
+  connection self-closes after `EVENT_STREAM_MAX_SECONDS` (10 min);
+  `EventSource` reconnects automatically once a stream ends.
 
 ## Future / Deferred Modules
 
