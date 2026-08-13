@@ -62,7 +62,28 @@ from werkzeug.utils import secure_filename
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "dev_secret_change_this")
+
+# FLASK_ENV is treated as production-like unless explicitly set to "development" —
+# an unset value must fail closed, not silently behave as dev. This is what lets
+# SECRET_KEY / ENCRYPTION_KEY fail fast below instead of falling back to an
+# insecure or ephemeral value that only "happens" to be safe in dev.
+FLASK_ENV = os.getenv("FLASK_ENV", "production")
+IS_DEV_ENV = FLASK_ENV == "development"
+
+_secret_key = os.getenv("SECRET_KEY")
+if not _secret_key:
+    if not IS_DEV_ENV:
+        raise RuntimeError(
+            "SECRET_KEY is not set. Refusing to start outside FLASK_ENV=development — "
+            "an insecure fallback here means session cookies (including admin sessions) "
+            "are forgeable. Generate one with: "
+            'python3 -c "import secrets; print(secrets.token_urlsafe(48))" '
+            "and set it in .env."
+        )
+    _secret_key = "dev_secret_change_this"
+    print("WARNING: SECRET_KEY not set — using an insecure development-only fallback "
+          "(allowed because FLASK_ENV=development). Do not deploy like this.")
+app.secret_key = _secret_key
 app.permanent_session_lifetime = timedelta(minutes=int(os.getenv("SESSION_TIMEOUT_MIN", "60")))
 
 # X-Forwarded-For is client-supplied and must never be trusted blindly — an attacker
@@ -99,6 +120,14 @@ DB_CONFIG = {
 # ─────────────────────────────────────────────
 _enc_key = os.getenv("ENCRYPTION_KEY")
 if not _enc_key:
+    if not IS_DEV_ENV:
+        raise RuntimeError(
+            "ENCRYPTION_KEY is not set. Refusing to start outside FLASK_ENV=development — "
+            "a generated-at-restart key would silently and permanently brick every existing "
+            "encrypted gov-ID upload, 2FA secret and stored API key. Generate one with: "
+            'python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" '
+            "and set it in .env."
+        )
     _enc_key = Fernet.generate_key().decode()
     print("=" * 70)
     print("WARNING: No ENCRYPTION_KEY set. Temporary key generated for dev only.")
