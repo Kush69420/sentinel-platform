@@ -86,6 +86,14 @@ if not _secret_key:
 app.secret_key = _secret_key
 app.permanent_session_lifetime = timedelta(minutes=int(os.getenv("SESSION_TIMEOUT_MIN", "60")))
 
+# Session cookie hardening. HTTPONLY and SAMESITE=Lax apply unconditionally — neither
+# has a dev-mode downside. SECURE (browser will not send the cookie over plain HTTP at
+# all) is relaxed only in dev, since local `flask run` / a throwaway Docker MySQL setup
+# is normally accessed over http://localhost without TLS in front.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = not IS_DEV_ENV
+
 # X-Forwarded-For is client-supplied and must never be trusted blindly — an attacker
 # who can set it defeats the login rate limit, the lockout counter and the IP recorded
 # in activity_log. Only honour as many hops as we actually run behind.
@@ -330,6 +338,43 @@ def csrf_token_endpoint():
     if not session.get("csrf_token"):
         session["csrf_token"] = _new_csrf_token()
     return jsonify({"csrf_token": session["csrf_token"]})
+
+
+# ─────────────────────────────────────────────
+# SECURITY HEADERS
+#
+# No security headers were set anywhere before this. The CSP below allows
+# 'unsafe-inline' for scripts and styles because every template ships its CSS
+# and JS inline with no nonce plumbing — tightening that is a real frontend
+# change (adding a per-request nonce to every <script>/<style> tag across 9
+# templates), not a one-line header, so it is left as a follow-up rather than
+# attempted half-done here. img-src allows data: for the base64 2FA QR codes
+# generated in setup_2fa().
+# ─────────────────────────────────────────────
+_CSP_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+
+@app.after_request
+def _set_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = _CSP_POLICY
+    # Only meaningful (and only sent) once the app is actually reachable over HTTPS —
+    # sending it in dev over plain http://localhost would just be noise, and could be
+    # actively wrong if a future request ever is proxied without TLS.
+    if not IS_DEV_ENV and request.is_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
 
 
 # ─────────────────────────────────────────────
