@@ -116,6 +116,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_EXT = {"png", "jpg", "jpeg", "pdf"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
 
+# Upper bound on a single /api/events SSE connection's lifetime — see event_stream().
+EVENT_STREAM_MAX_SECONDS = 600
+
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
     "user": os.getenv("DB_USER", "root"),
@@ -263,6 +266,22 @@ def user_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if not session.get("is_user"):
+            return jsonify({"error": "Authentication required"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def session_required(f):
+    """Require either an authenticated user or admin session.
+
+    For endpoints whose content is the same regardless of which side is
+    calling (e.g. the /api/events sync heartbeat, consumed by both
+    dashboard.html and admin.html) — this only excludes fully anonymous
+    callers, not one role or the other.
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not (session.get("is_user") or session.get("is_admin")):
             return jsonify({"error": "Authentication required"}), 401
         return f(*args, **kwargs)
     return wrapper
@@ -1587,6 +1606,13 @@ def reject_lea_application(app_id):
 @app.route("/uploads/<filename>")
 @admin_required
 def serve_upload(filename):
+    # The write path (lea_register()) already runs uploaded names through
+    # secure_filename() before saving — this is the same guard on the read side,
+    # so a URL segment like "../../etc/passwd" or an absolute path can't escape
+    # UPLOAD_FOLDER. Admin-only already, this is defense-in-depth.
+    filename = secure_filename(filename)
+    if not filename:
+        return jsonify({"error": "Not found"}), 404
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     if not os.path.isfile(filepath):
         return jsonify({"error": "Not found"}), 404
@@ -2769,9 +2795,22 @@ def admin_health():
 
 
 @app.route("/api/events")
+@session_required
 def event_stream():
+    """Server-sent heartbeat that tells admin.html/dashboard.html to refresh
+    already-authorized data (see their onmessage handlers) — the payload
+    itself is just a sync ping, no sensitive data.
+
+    Was unauthenticated with an unbounded per-connection loop: any client
+    could open unlimited sockets that never terminated (connection-exhaustion
+    DoS). Now requires a session (either side — the content is identical for
+    both) and each connection self-closes after EVENT_STREAM_MAX_SECONDS;
+    EventSource reconnects automatically once a stream ends, so a legitimate
+    client sees no behavior change beyond a periodic reconnect.
+    """
     def gen():
-        while True:
+        started = time.monotonic()
+        while time.monotonic() - started < EVENT_STREAM_MAX_SECONDS:
             yield f"data: {json.dumps({'type':'sync','ts':time.time()})}\n\n"
             time.sleep(5)
     return Response(gen(), mimetype="text/event-stream")
