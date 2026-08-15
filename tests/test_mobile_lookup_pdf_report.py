@@ -36,8 +36,12 @@ class FakeCursor:
             self._result = [dict(row)] if row else []
 
         elif q.startswith("SELECT * FROM master_data_records"):
+            # Mirrors the real query's WHERE (source_type IN (...) AND record_key=%s)
+            # and ORDER BY created_at DESC LIMIT 1, so a regression in either the
+            # exact-match filter or the "most recent wins" ordering is caught here.
             rows = [r for r in self.db.get("master_data_records", [])
-                    if r["record_key"] == params[0]]
+                    if r["source_type"] in ("subscriber", "custom") and r["record_key"] == params[0]]
+            rows.sort(key=lambda r: r["created_at"])
             self._result = [dict(rows[-1])] if rows else []
 
         elif q.startswith("SELECT setting_value FROM app_settings WHERE setting_key=%s"):
@@ -162,8 +166,10 @@ class MobileLookupPdfReportTests(unittest.TestCase):
         case reference."""
         del self.db["subscriber_records"]["9876543210"]
         self.db["master_data_records"].append({
+            "source_type": "subscriber",
             "record_key": "19876543210X",  # contains the query value as a substring
             "data_json": '{"subscriber_name": "Wrong Person"}',
+            "created_at": datetime(2026, 8, 1),
         })
         self._login(user_id=1)
         resp = self.client.get("/api/tools/run/report/pdf/1")
@@ -172,8 +178,46 @@ class MobileLookupPdfReportTests(unittest.TestCase):
     def test_master_data_fallback_accepts_exact_match(self):
         del self.db["subscriber_records"]["9876543210"]
         self.db["master_data_records"].append({
+            "source_type": "subscriber",
             "record_key": "9876543210",
             "data_json": '{"subscriber_name": "Ramesh Kumar"}',
+            "created_at": datetime(2026, 8, 1),
+        })
+        self._login(user_id=1)
+        resp = self.client.get("/api/tools/run/report/pdf/1")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data.startswith(b"%PDF"))
+
+    def test_master_data_fallback_ignores_other_source_types(self):
+        """An exact record_key match outside source_type ('subscriber', 'custom')
+        (e.g. a vehicle or BTS import that happens to reuse the same key) must not
+        be pulled into a mobile_lookup report."""
+        del self.db["subscriber_records"]["9876543210"]
+        self.db["master_data_records"].append({
+            "source_type": "vehicle",
+            "record_key": "9876543210",
+            "data_json": '{"subscriber_name": "Wrong Record Type"}',
+            "created_at": datetime(2026, 8, 1),
+        })
+        self._login(user_id=1)
+        resp = self.client.get("/api/tools/run/report/pdf/1")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_master_data_fallback_picks_most_recent_match(self):
+        """ORDER BY created_at DESC LIMIT 1 — the newest of several exact matches
+        for the same record_key wins, not the first or last inserted."""
+        del self.db["subscriber_records"]["9876543210"]
+        self.db["master_data_records"].append({
+            "source_type": "subscriber",
+            "record_key": "9876543210",
+            "data_json": '{"subscriber_name": "Stale Import"}',
+            "created_at": datetime(2026, 1, 1),
+        })
+        self.db["master_data_records"].append({
+            "source_type": "custom",
+            "record_key": "9876543210",
+            "data_json": '{"subscriber_name": "Ramesh Kumar"}',
+            "created_at": datetime(2026, 8, 1),
         })
         self._login(user_id=1)
         resp = self.client.get("/api/tools/run/report/pdf/1")

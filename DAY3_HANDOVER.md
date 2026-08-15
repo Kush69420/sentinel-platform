@@ -34,9 +34,23 @@ never updated to match.
 
 Fix: same as the charging path — exact `record_key=%s`, no `LIKE`.
 
-`tests/test_mobile_lookup_pdf_report.py` gained two tests: a substring-only match now
-returns 404 (`test_master_data_fallback_rejects_substring_match`), an exact
-`record_key` match still succeeds (`test_master_data_fallback_accepts_exact_match`).
+`tests/test_mobile_lookup_pdf_report.py` gained four tests covering the fallback
+query's full `WHERE`/`ORDER BY` shape, not just the exact-vs-substring match: a
+substring-only match now 404s (`test_master_data_fallback_rejects_substring_match`),
+an exact `record_key` match still succeeds
+(`test_master_data_fallback_accepts_exact_match`), a same-key match outside
+`source_type IN ('subscriber','custom')` is ignored
+(`test_master_data_fallback_ignores_other_source_types`), and the most recent of
+several matches wins (`test_master_data_fallback_picks_most_recent_match`).
+
+**Accepted consequence, not a bug to fix further:** since no MySQL instance exists yet
+anywhere (see `CLAUDE.md`), there is no real database with historical `search_logs`
+rows billed under the old substring-match logic to worry about — but for the record,
+once real data exists, a `search_logs` row whose original hit only matched via the old
+substring logic (not an exact `record_key`) will 404 on PDF regeneration after this fix
+rather than reprint a possibly-wrong record. That's the correct trade-off, not a
+regression: the alternative is knowingly keeping the substring-match hole open for
+report regeneration.
 
 ## Verification
 
