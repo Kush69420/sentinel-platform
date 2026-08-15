@@ -2653,9 +2653,12 @@ def mobile_lookup_report_pdf(search_log_id):
     cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query_value,))
     record = cursor.fetchone()
     if not record:
+        # Exact key only — same reasoning as the run_tool_generic() charging path
+        # (see the comment there): a substring match here could print a PDF report,
+        # tied to a real case reference, carrying an unrelated subscriber's data.
         cursor.execute(
-            "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND (record_key=%s OR data_json LIKE %s) ORDER BY created_at DESC LIMIT 1",
-            (query_value, f"%{query_value}%"),
+            "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND record_key=%s ORDER BY created_at DESC LIMIT 1",
+            (query_value,),
         )
         fallback = cursor.fetchone()
         if fallback:

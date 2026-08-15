@@ -36,7 +36,9 @@ class FakeCursor:
             self._result = [dict(row)] if row else []
 
         elif q.startswith("SELECT * FROM master_data_records"):
-            self._result = []
+            rows = [r for r in self.db.get("master_data_records", [])
+                    if r["record_key"] == params[0]]
+            self._result = [dict(rows[-1])] if rows else []
 
         elif q.startswith("SELECT setting_value FROM app_settings WHERE setting_key=%s"):
             val = self.db["app_settings"].get(params[0])
@@ -95,6 +97,7 @@ def make_db():
             },
         },
         "app_settings": {"app_name": "SENTINEL", "login_notice": "Restricted access only."},
+        "master_data_records": [],
     }
 
 
@@ -151,6 +154,31 @@ class MobileLookupPdfReportTests(unittest.TestCase):
         self._login(user_id=1)
         resp = self.client.get("/api/tools/run/report/pdf/1")
         self.assertEqual(resp.status_code, 404)
+
+    def test_master_data_fallback_rejects_substring_match(self):
+        """The master_data_records fallback must use an exact record_key match,
+        same as the run_tool_generic() charging path — a substring match here
+        would print an unrelated subscriber's data into a PDF tied to a real
+        case reference."""
+        del self.db["subscriber_records"]["9876543210"]
+        self.db["master_data_records"].append({
+            "record_key": "19876543210X",  # contains the query value as a substring
+            "data_json": '{"subscriber_name": "Wrong Person"}',
+        })
+        self._login(user_id=1)
+        resp = self.client.get("/api/tools/run/report/pdf/1")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_master_data_fallback_accepts_exact_match(self):
+        del self.db["subscriber_records"]["9876543210"]
+        self.db["master_data_records"].append({
+            "record_key": "9876543210",
+            "data_json": '{"subscriber_name": "Ramesh Kumar"}',
+        })
+        self._login(user_id=1)
+        resp = self.client.get("/api/tools/run/report/pdf/1")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data.startswith(b"%PDF"))
 
 
 class PdfInjectionTest(unittest.TestCase):
