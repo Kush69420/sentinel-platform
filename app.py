@@ -1408,6 +1408,9 @@ def admin_login():
     conn.commit()
     conn.close()
 
+    # Regenerate the session on privilege change so a pre-login fixated cookie
+    # cannot be reused as an authenticated admin one (same fix as user_login).
+    session.clear()
     session.permanent = True
     session["is_admin"] = True
     session["admin_id"] = admin["id"]
@@ -2663,7 +2666,10 @@ def mobile_lookup_report_pdf(search_log_id):
     if not log:
         conn.close()
         return jsonify({"error": "Report not found."}), 404
-    if not log.get("credits_used") or (log.get("sources_queried") or "").strip().lower() == "no match":
+    # credits_used is 0 both for a genuine miss and for a match against a
+    # service the admin has marked free — sources_queried is the only field
+    # that actually distinguishes "found nothing" from "found it, for free".
+    if (log.get("sources_queried") or "").strip().lower() == "no match":
         conn.close()
         return jsonify({"error": "No successful search found for this record — nothing to report."}), 400
 
