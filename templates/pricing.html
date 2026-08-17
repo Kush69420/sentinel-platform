@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>SENTINEL — Pricing</title>
+<link rel="icon" href="/static/favicon.ico">
 <style>
 :root{--bg:#050910;--surface:#0a111b;--panel:#0e1a29;--border:#18314f;--cyan:#00d2ff;--green:#37ff97;--red:#ff4f73;--amber:#ffbf38;--text:#e5f4ff;--muted:#7696b6;--mono:Consolas,monospace;--sans:Inter,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:22px;background:radial-gradient(circle at 50% -20%,rgba(0,210,255,.18),transparent 34%),var(--bg);color:var(--text);font-family:var(--sans)}body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,210,255,.015) 3px,rgba(0,210,255,.015) 4px)}.wrap{width:min(1080px,100%);margin:0 auto;position:relative;z-index:1}
 nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:34px}.brand{font-family:var(--mono);letter-spacing:7px;color:var(--cyan);font-size:20px;text-shadow:0 0 24px rgba(0,210,255,.5);text-decoration:none}nav .links{display:flex;gap:16px;align-items:center}nav a{color:var(--muted);text-decoration:none;font-size:13px}nav a:hover{color:var(--cyan)}
@@ -42,7 +43,7 @@ h1{text-align:center;font-family:var(--mono);letter-spacing:4px;font-size:26px;m
   <div class="note" id="providerNote"></div>
 </div>
 <script>
-/* CSRF (Day 2): /api/payments/checkout is @user_required, so a signed-in
+/* CSRF: /api/payments/checkout is @user_required, so a signed-in
    visitor here needs the header too — see _enforce_csrf() in app.py. */
 (function(){
   let csrfToken=null,csrfPromise=null;

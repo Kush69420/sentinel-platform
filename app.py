@@ -707,6 +707,24 @@ def cdr_analysis_page():
     return render_template("cdr_analysis.html")
 
 
+@app.route("/robots.txt")
+def robots_txt():
+    return Response("User-agent: *\nDisallow: /\n", mimetype="text/plain")
+
+
+# ─────────────────────────────────────────────
+# ERROR HANDLERS
+# ─────────────────────────────────────────────
+@app.errorhandler(404)
+def handle_404(e):
+    return render_template("error.html", code=404, message="Page not found."), 404
+
+
+@app.errorhandler(500)
+def handle_500(e):
+    return render_template("error.html", code=500, message="Something went wrong on our end."), 500
+
+
 # ─────────────────────────────────────────────
 # PUBLIC TILE CATALOGS
 # ─────────────────────────────────────────────

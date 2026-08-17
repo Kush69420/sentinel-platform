@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>SENTINEL — Mission Control Dashboard</title>
+<link rel="icon" href="/static/favicon.ico">
 <style>
 :root{
   --bg:#050910;--surface:#0a111b;--panel:#0e1a29;--panel2:#111f33;--border:#18314f;--border2:#25517b;
@@ -112,7 +113,7 @@ body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repe
 <div class="modal" id="profileModal"><div class="modal-card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h3 style="margin:0;color:var(--cyan);font-family:var(--mono);font-size:15px">USER PROFILE / SECURITY</h3><button class="btn" onclick="profileModal.classList.remove('show')">✕</button></div><div id="profileBody"><div class="muted">Loading...</div></div></div></div>
 <div class="toast" id="toast"></div>
 <script>
-/* CSRF (Day 2): every POST/PUT/DELETE on an authenticated session must carry
+/* CSRF: every POST/PUT/DELETE on an authenticated session must carry
    the session's token in X-CSRF-Token — see _enforce_csrf() in app.py. Wrapping
    fetch here means every call site below gets it automatically instead of each
    of them needing to know about CSRF. */

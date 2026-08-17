@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{{ code }} — SENTINEL</title>
+<link rel="icon" href="/static/favicon.ico">
+<style>
+:root{--bg:#050910;--surface:#0a111b;--panel:#0e1a29;--border:#18314f;--border2:#25517b;--cyan:#00d2ff;--green:#37ff97;--red:#ff4f73;--amber:#ffbf38;--purple:#a46bff;--text:#e5f4ff;--muted:#7696b6;--mono:Consolas,monospace;--sans:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 50% -15%,rgba(0,210,255,.18),transparent 35%),var(--bg);color:var(--text);font-family:var(--sans);text-align:center;padding:24px}
+.brand{font-family:var(--mono);letter-spacing:6px;color:var(--cyan);font-size:19px;text-shadow:0 0 24px rgba(0,210,255,.5);margin-bottom:32px}
+.brand span{color:var(--red)}
+.card{border:1px solid var(--border);background:rgba(10,17,27,.92);border-radius:18px;padding:40px 36px;max-width:420px;box-shadow:0 18px 70px rgba(0,0,0,.28)}
+.code{font-family:var(--mono);font-size:56px;color:var(--red);text-shadow:0 0 24px rgba(255,79,115,.35)}
+.message{color:#9bb5ce;font-size:16px;margin:14px 0 26px}
+.btn{display:inline-block;border:1px solid var(--cyan);background:rgba(0,210,255,.1);color:var(--cyan);border-radius:10px;padding:10px 20px;font-family:var(--mono);font-size:12px;letter-spacing:1px;text-decoration:none}
+</style>
+</head>
+<body>
+<div>
+<div class="brand">SEN<span>TI</span>NEL</div>
+<div class="card">
+<div class="code">{{ code }}</div>
+<p class="message">{{ message }}</p>
+<a class="btn" href="/">▶ Back to home</a>
+</div>
+</div>
+</body>
+</html>
