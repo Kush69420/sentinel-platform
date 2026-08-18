@@ -144,7 +144,12 @@ services:
     # To move to a named tunnel later: replace the command with
     #   tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     # and point the tunnel's public hostname at http://nginx:80.
-    command: tunnel --no-autoupdate --url http://nginx:80
+    # --protocol http2 is REQUIRED on this network, not a preference: the campus
+    # gateway silently drops outbound TCP 7844, which is what cloudflared's default
+    # QUIC/h2mux edge transport uses. http2 forces the edge connection over TCP 443,
+    # which is open. Symptom if this is removed: "failed to request quick Tunnel ...
+    # context deadline exceeded".
+    command: tunnel --no-autoupdate --protocol http2 --url http://nginx:80
     depends_on:
       nginx:
         condition: service_healthy

@@ -63,6 +63,37 @@ If you ever do point `SENTINEL_MYSQL_DIR` at the btrfs pool, run
 
 ---
 
+## Before anything: check the captive portal
+
+The NAS sits behind an IIIT-NR Cyberoam/Sophos gateway that SSL-bumps **all** outbound
+HTTPS and authorises per source IP. When its session lapses, every HTTPS host — Docker
+Hub, PyPI, `api.trycloudflare.com`, even `debian.org` — returns an identical ~727-byte
+portal login page **under HTTP 200**, not a redirect and not a 407.
+
+This one condition masquerades as three unrelated failures: `docker pull` reporting
+`x509: certificate signed by unknown authority`, `pip install` failing inside
+`docker build`, and `cloudflared` timing out on `POST https://api.trycloudflare.com/tunnel`.
+Check it first, before debugging anything else:
+
+```bash
+curl -s -o /tmp/x -w '%{http_code} %{size_download}\n' https://www.debian.org/
+# 200 with ~727 bytes  -> portal session lapsed, nothing else will work
+# 200 with ~100KB      -> fine
+```
+
+Re-authenticate from the NAS's **own IP** — the portal authorises per source address,
+so logging in from a laptop does not help the NAS. Sessions expire, so a long-running
+deploy wants either a keepalive or a MAC/IP exemption from campus IT. Note that
+trusting the Sophos CA does *not* fix this; it only makes the portal page verify
+cleanly instead of erroring.
+
+Two knock-on effects on this deploy:
+- Every lapse drops the tunnel, and the quick tunnel comes back on a **different**
+  hostname.
+- Outbound **TCP 7844 is blocked** on this network, which is cloudflared's default
+  QUIC edge transport. `docker-compose.yml` therefore pins `--protocol http2` (TCP 443).
+  Do not remove that flag here.
+
 ## First-time bring-up
 
 ```bash
@@ -205,3 +236,5 @@ replaced by their Docker equivalents.
 - **Quick tunnel limits**: random hostname per restart, ~200 concurrent in-flight
   requests before 429s, no Cloudflare Access. Replace with a named tunnel once a
   domain exists.
+- **The campus gateway is the single most likely cause of any outage here.** See the
+  portal section at the top before suspecting the stack.
