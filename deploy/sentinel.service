@@ -1,3 +1,6 @@
+# NATIVE-INSTALL reference unit. The homelab deploy supervises the app with
+# Docker Compose (deploy/docker-compose.yml) instead; this is kept for the
+# eventual move to paid compute.
 [Unit]
 Description=Sentinel Platform (gunicorn)
 After=network.target mysql.service

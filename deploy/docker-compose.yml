@@ -1,0 +1,160 @@
+# SENTINEL Platform — Docker Compose stack for the OMV homelab (staging).
+#
+# Replaces deploy/sentinel.service + deploy/nginx.conf (the native-install reference,
+# kept for the eventual move to paid compute). Bring up with:
+#   cd deploy && ./prepare-host.sh && docker compose up -d
+#
+# Topology — nothing is published to the LAN; the only inbound path is the tunnel:
+#   Cloudflare edge (TLS) --outbound tunnel--> cloudflared -> nginx -> app -> mysql
+#
+# Two facts about the host drive most of the choices below (see DOCKER_DEPLOY.md):
+#   1. /var/lib/docker is on the 28 GiB OS disk. All state is bind-mounted onto the
+#      big pools and every service caps its log size, or the root fs fills and takes
+#      OMV down with it.
+#   2. 7.7 GiB RAM total, shared with the existing jellyfin/navidrome containers, so
+#      every service has an explicit mem_limit and cannot starve them.
+
+name: sentinel
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: sentinel-mysql
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 3g
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in deploy/.env}
+      # Must stay sentinel_db — db_setup.sql hardcodes `USE sentinel_db`.
+      MYSQL_DATABASE: sentinel_db
+      MYSQL_USER: ${SENTINEL_DB_USER:-sentinel_user1}
+      MYSQL_PASSWORD: ${SENTINEL_DB_PASSWORD:?set SENTINEL_DB_PASSWORD in deploy/.env}
+    volumes:
+      # Datadir on `blue` (ext4). Deliberately NOT on the btrfs pool: copy-on-write
+      # fragments InnoDB and RAID1 doubles every write, worst during the bulk import.
+      # Redundancy is bought back by backup.sh dumping to the RAID1 pool instead.
+      - ${SENTINEL_MYSQL_DIR:?set SENTINEL_MYSQL_DIR in deploy/.env}:/var/lib/mysql
+      - ./my.cnf:/etc/mysql/conf.d/sentinel.cnf:ro
+      # Schema sources, read-only, applied once by the init script on an empty datadir.
+      - ../db_setup.sql:/sentinel-sql/db_setup.sql:ro
+      - ../migration_admin_customization.sql:/sentinel-sql/migration_admin_customization.sql:ro
+      - ../migration_fix_import_errors.sql:/sentinel-sql/migration_fix_import_errors.sql:ro
+      - ../migration_selfserve_auth.sql:/sentinel-sql/migration_selfserve_auth.sql:ro
+      - ../migration_coming_soon.sql:/sentinel-sql/migration_coming_soon.sql:ro
+      - ./db-init/00-apply-schema.sh:/docker-entrypoint-initdb.d/00-apply-schema.sh:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # Generous: first boot applies four schema files before MySQL accepts traffic,
+      # and this is a spinning disk.
+      start_period: 180s
+    networks: [sentinel]
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sentinel-app:local
+    container_name: sentinel-app
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 1g
+    # app.env holds the application's own secrets (SECRET_KEY, ENCRYPTION_KEY, ...).
+    # It is a separate file from .env so that MYSQL_ROOT_PASSWORD, which .env needs for
+    # compose interpolation, is never injected into the app container.
+    env_file: [app.env]
+    environment:
+      # Authoritative overrides — these must match the topology, not whatever app.env
+      # happens to say.
+      DB_HOST: mysql
+      DB_NAME: sentinel_db
+      FLASK_ENV: production
+      # Exactly one trusted hop: nginx emits a single X-Forwarded-For value after the
+      # realip module has recovered the true client. See nginx.docker.conf.
+      TRUSTED_PROXY_COUNT: "1"
+    volumes:
+      # Encrypted gov-ID uploads live on the btrfs RAID1 pool — they are irreplaceable
+      # and small, so mirroring costs nothing meaningful here.
+      - ${SENTINEL_UPLOADS_DIR:?set SENTINEL_UPLOADS_DIR in deploy/.env}:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      # `/` is enough to prove the WSGI app is serving; it does not touch the DB, so a
+      # DB outage shows up as /api/admin/health going red rather than as a restart loop.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [sentinel]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: sentinel-nginx
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 128m
+    ports:
+      # Loopback ONLY, and only for debugging from a shell on the NAS — cloudflared
+      # reaches nginx over the compose network, not through this. Never bind 0.0.0.0:
+      # host :80 is OMV's own web UI, and exposing nginx to the LAN would let any LAN
+      # client forge CF-Connecting-IP and defeat the login rate limit (see
+      # realip.cloudflare.conf).
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./nginx.docker.conf:/etc/nginx/conf.d/default.conf:ro
+      # Cloudflare variant: reads CF-Connecting-IP. Swap to realip.tailscale.conf if
+      # the access layer ever changes; see those files for why they are not one file.
+      - ./realip.cloudflare.conf:/etc/nginx/conf.d/realip.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks: [sentinel]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: sentinel-cloudflared
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 128m
+    # QUICK TUNNEL — interim, until a domain is bought and a named tunnel replaces it.
+    # Consequences you are accepting by running this form:
+    #   * The public hostname is random and CHANGES ON EVERY RESTART of this container.
+    #     Read it with: docker compose logs cloudflared | grep trycloudflare.com
+    #   * Cloudflare rate-limits quick tunnels (~200 concurrent in-flight requests,
+    #     429s past that) and states they are not for production use.
+    #   * Cloudflare Access CANNOT be applied to a quick tunnel, so there is NO auth
+    #     layer in front of the app. The admin/admin123 seed from db_setup.sql is
+    #     therefore internet-reachable — set a strong password on that account during
+    #     bring-up (see DOCKER_DEPLOY.md).
+    # To move to a named tunnel later: replace the command with
+    #   tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    # and point the tunnel's public hostname at http://nginx:80.
+    command: tunnel --no-autoupdate --url http://nginx:80
+    depends_on:
+      nginx:
+        condition: service_healthy
+    networks: [sentinel]
+
+networks:
+  sentinel:
+    driver: bridge
+    ipam:
+      config:
+        # Pinned because realip.*.conf hardcodes this CIDR as the trusted peer range.
+        # If you change it, change those files too.
+        - subnet: 172.28.0.0/16
