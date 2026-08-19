@@ -155,6 +155,45 @@ This is a stopgap for a staging box, not a fix, and it does not change `db_setup
 
 ---
 
+## Deploying: push to the branch
+
+The NAS runs continuous deployment. **`git push` is the deploy** — you should not need
+to SSH in to ship a change.
+
+`sentinel-deploy.timer` fires every 3 minutes and runs `sentinel-deploy.sh`, which
+pulls the tracked branch when it moves, rebuilds, and waits for every service to come
+back healthy. If the build fails or the stack does not go healthy within
+`SENTINEL_HEALTH_TIMEOUT` (default 180s), it resets to the previous commit and rebuilds
+that instead, so a bad push self-heals rather than leaving the site down.
+
+Host config is deployed the same way. The systemd unit and timer (`deploy/systemd/`),
+the deploy script itself, and `/etc/docker/daemon.json` (`deploy/docker-daemon.json`)
+are all re-applied from the repo when they change — so editing them means committing,
+not SSHing. `dockerd` is only restarted when its config genuinely changes, because that
+bounces every container on the box, including Jellyfin and Navidrome.
+
+```bash
+tail -f /var/log/sentinel-deploy.log      # watch a deploy
+systemctl start sentinel-deploy.service   # force one now, don't wait for the timer
+systemctl list-timers sentinel-deploy.timer
+```
+
+One-time bootstrap on a fresh box (the only step that must be run by hand):
+
+```bash
+cd <stack>/deploy && sudo ./install-cd.sh
+```
+
+Things that will legitimately stop a deploy, and what they mean in the log:
+- `SKIP git fetch failed` — the campus network session lapsed, not a deploy problem.
+  `systemctl restart caa`; the next tick recovers on its own.
+- `ERROR git pull --ff-only failed` — someone edited files directly on the box and the
+  tree diverged. This is deliberate: a `reset --hard` here would silently destroy that
+  work. Resolve it by hand, then deploys resume.
+- `WARN <file> is missing keys present in <example>` — a new setting was added to an
+  `env.*.example` but not to the live env file on the box. The env files hold secrets,
+  are gitignored, and are never edited automatically; add the key yourself.
+
 ## Day-to-day
 
 ```bash
@@ -162,7 +201,7 @@ docker compose ps
 docker compose logs -f app
 docker compose restart app
 docker compose down                  # stop; data survives in the bind mounts
-docker compose up -d --build         # after a git pull
+docker compose up -d --build         # manual deploy; normally the timer does this
 ```
 
 ### Backups
