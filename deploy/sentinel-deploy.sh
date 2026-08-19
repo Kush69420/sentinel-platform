@@ -101,6 +101,10 @@ if [ "$reload_systemd" -eq 1 ]; then
     systemctl daemon-reload
     systemctl enable --now sentinel-deploy.timer >/dev/null 2>&1
     systemctl enable --now caa-renew.timer >/dev/null 2>&1
+    # Enable only, not --now: caa-renew.service is now also boot-activated
+    # (multi-user.target), but starting it here mid-deploy would re-auth and
+    # drop the link out from under this very run.
+    systemctl enable caa-renew.service >/dev/null 2>&1
 fi
 
 # Docker daemon settings — notably the explicit DNS servers, without which BuildKit

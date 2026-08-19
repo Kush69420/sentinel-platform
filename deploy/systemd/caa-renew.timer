@@ -5,7 +5,10 @@ Description=Re-authenticate the campus captive-portal session every 2 hours
 # The portal expires the session on its own schedule and caa does not always notice;
 # when it lapses the box looks online (HTTP 200) but every response is the ~727-byte
 # portal page. Re-authenticating on a fixed cycle is cheaper than detecting that.
-OnBootSec=2min
+# caa-renew.service is now also boot-activated directly via multi-user.target,
+# so this OnBootSec just needs to be a safety net after that boot run, not the
+# primary trigger — 5min gives it room to land second rather than racing it.
+OnBootSec=5min
 OnUnitActiveSec=2h
 # Spread the re-auth so a fleet of machines does not hit the portal in lockstep, and
 # so the drop never lands at exactly the same point in the deploy timer's cycle.
