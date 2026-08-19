@@ -14,10 +14,16 @@
 set -euo pipefail
 
 SQL_DIR=/sentinel-sql
+DB_NAME="${MYSQL_DATABASE:-sentinel_db}"
 
+# Pass the database on the command line rather than relying on the .sql file to select
+# it. The canonical four each carry their own CREATE DATABASE/USE, but a file that does
+# not (migration_coming_soon.sql) otherwise dies with "ERROR 1046: No database selected"
+# — and because the entrypoint only runs this once, on an empty datadir, that failure is
+# easy to miss and annoying to recover from. -D is harmless for files that USE anyway.
 run() {
     echo "==> applying $1"
-    mysql --protocol=socket -uroot -p"${MYSQL_ROOT_PASSWORD}" < "${SQL_DIR}/$1"
+    mysql --protocol=socket -uroot -p"${MYSQL_ROOT_PASSWORD}" -D "${DB_NAME}" < "${SQL_DIR}/$1"
 }
 
 # Order per CLAUDE.md. Each file is idempotent; the order is not optional.
