@@ -37,7 +37,11 @@ touch /var/log/sentinel-deploy.log && chmod 0640 /var/log/sentinel-deploy.log
 # git runs as root against a tree owned by another user, and the source drive is mounted
 # 777 so every file otherwise looks mode-modified. Both make git refuse to work or report
 # a permanently dirty tree, which would block --ff-only pulls forever.
-git config --global --add safe.directory "$STACK_DIR" 2>/dev/null || true
+#
+# --system (writes /etc/gitconfig), NOT --global: systemd does not set HOME for services,
+# so git under the timer never reads /root/.gitconfig and every fetch dies with "detected
+# dubious ownership". --system is independent of HOME and works for both paths.
+git config --system --add safe.directory "$STACK_DIR" 2>/dev/null || true
 git -C "$STACK_DIR" config core.fileMode false
 
 cat > /etc/logrotate.d/sentinel-deploy <<'ROTATE'
