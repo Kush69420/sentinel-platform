@@ -1,0 +1,21 @@
+[Unit]
+Description=Client Authentication Agent (campus captive-portal session)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/root
+# caa refuses to start if /root/.caa/caa.pid names a live process — but it never
+# clears the file on an unclean exit, and Linux recycles PIDs. A stale pidfile that
+# happened to name php-fpm wedged every restart for hours ("caa already running with
+# Process Id 740") while the box sat with no internet. systemd already guarantees a
+# single instance of this unit, and caa is only ever started through it, so removing
+# the pidfile before each start is safe and makes a restart always actually restart.
+ExecStartPre=-/bin/rm -f /root/.caa/caa.pid
+ExecStart=/usr/local/bin/caa -v -l /var/log/caa.log
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

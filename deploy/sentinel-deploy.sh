@@ -72,10 +72,25 @@ if ! cmp -s deploy/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh; then
     log "INFO deploy script itself updated; next run uses the new version"
 fi
 
+# The captive-portal renewal script, alongside the units below. Not restarted here —
+# it is a oneshot driven by its own timer, so the next tick picks up the new version.
+if [ -f deploy/caa-renew.sh ] && ! cmp -s deploy/caa-renew.sh /usr/local/bin/caa-renew.sh; then
+    install -m 0755 deploy/caa-renew.sh /usr/local/bin/caa-renew.sh
+    log "INFO updated /usr/local/bin/caa-renew.sh"
+fi
+
 # Host-level config lives in the repo too, so that changing it is a `git push` rather
 # than an SSH session. Anything synced here must be idempotent and safe to re-apply.
+#
+# caa.service is here because the network session this whole box depends on is host
+# state that was previously only ever edited over SSH — losing it loses internet, and
+# the stale-pidfile guard in it is the difference between a restart working and the
+# box sitting offline. Syncing it does NOT restart caa: that would drop the link
+# mid-deploy. A changed caa.service takes effect at the next caa-renew tick.
 reload_systemd=0
-for unit in sentinel-deploy.service sentinel-deploy.timer; do
+for unit in sentinel-deploy.service sentinel-deploy.timer \
+            caa.service caa-renew.service caa-renew.timer; do
+    [ -f "deploy/systemd/$unit" ] || continue
     if ! cmp -s "deploy/systemd/$unit" "/etc/systemd/system/$unit"; then
         install -m 0644 "deploy/systemd/$unit" "/etc/systemd/system/$unit"
         log "INFO updated /etc/systemd/system/$unit"
@@ -85,6 +100,7 @@ done
 if [ "$reload_systemd" -eq 1 ]; then
     systemctl daemon-reload
     systemctl enable --now sentinel-deploy.timer >/dev/null 2>&1
+    systemctl enable --now caa-renew.timer >/dev/null 2>&1
 fi
 
 # Docker daemon settings — notably the explicit DNS servers, without which BuildKit

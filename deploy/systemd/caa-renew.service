@@ -1,0 +1,8 @@
+[Unit]
+Description=Re-authenticate the campus captive-portal session
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/caa-renew.sh
