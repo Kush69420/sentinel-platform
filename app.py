@@ -49,6 +49,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from flask import (
     Flask,
     Response,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
@@ -59,6 +60,14 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
+
+try:
+    import psutil
+except ImportError:
+    # Optional: /api/admin/health reports storage from shutil.disk_usage regardless,
+    # and simply omits cpu_percent/ram_percent when psutil is unavailable. It is in
+    # requirements.txt, so this only bites a partially-installed environment.
+    psutil = None
 
 load_dotenv()
 
@@ -644,16 +653,32 @@ def _json_clean(row):
     return out
 
 def log_activity(admin_id, action: str, description: str):
+    # The caller never passes an IP: it is taken from the live request here so that
+    # every logged action fills activity_log.ip_address, not just the handful that
+    # happen to interpolate it into the free-text description. Outside a request
+    # (startup, background work) there is no peer address and the column stays NULL.
+    ip = _client_ip() if has_request_context() else None
     try:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO activity_log (admin_id, action, description, created_at)
-            VALUES (%s,%s,%s,NOW())
-            """,
-            (admin_id, action, description),
-        )
+        try:
+            cursor.execute(
+                """
+                INSERT INTO activity_log (admin_id, action, description, ip_address, created_at)
+                VALUES (%s,%s,%s,%s,NOW())
+                """,
+                (admin_id, action, description, ip or None),
+            )
+        except mysql.connector.Error:
+            # ip_address arrives via migration_admin_customization.sql; fall back for
+            # schemas that predate it rather than losing the log line entirely.
+            cursor.execute(
+                """
+                INSERT INTO activity_log (admin_id, action, description, created_at)
+                VALUES (%s,%s,%s,NOW())
+                """,
+                (admin_id, action, description),
+            )
         conn.commit()
         conn.close()
     except Exception as exc:
