@@ -1,0 +1,12 @@
+[Unit]
+Description=SENTINEL continuous deployment (pull + rebuild on new commits)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sentinel-deploy.conf
+ExecStart=/usr/local/bin/sentinel-deploy.sh
+# A build on spinning rust with 4 cores is slow; do not let systemd kill it midway.
+TimeoutStartSec=1800
