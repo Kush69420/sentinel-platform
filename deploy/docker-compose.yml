@@ -139,11 +139,16 @@ services:
     # for the probablysecure.tech zone. Do not route sentinel through that one and do not
     # edit its config — the two zones are kept deliberately independent.
     #
-    # Because this runs with --token, the ingress rules live in the Cloudflare Zero Trust
-    # dashboard, NOT in a local config file. The tunnel's Public Hostname must be
-    # sentinel.needlegal.in -> HTTP -> nginx:80 (container-network name; this container
-    # shares the `sentinel` network with nginx, so it does not use the host's :8080
-    # publish). Cloudflare creates the DNS record itself when that hostname is added.
+    # Ingress lives in ./cloudflared.sentinel.yml, in this repo — see that file. The
+    # tunnel runs locally-managed (config + credentials file) rather than with --token,
+    # so the route is reviewable in git instead of sitting behind a Zero Trust dashboard
+    # tab. Consequence: Cloudflare does NOT create the DNS record for us in this mode.
+    # The zone needs a proxied CNAME `sentinel` -> <tunnel-id>.cfargotunnel.com.
+    #
+    # The credentials file is derived from CLOUDFLARE_TUNNEL_TOKEN (the token is base64
+    # JSON carrying exactly the AccountTag/TunnelID/TunnelSecret a credentials file
+    # holds). It is not in git; it lives at SENTINEL_CLOUDFLARED_DIR on the host and must
+    # be owned by uid 65532, this image's nonroot user, or the tunnel cannot read it.
     #
     # Cloudflare Access can be applied to a named tunnel (it cannot to a quick one). It is
     # not enabled yet, so the app is still internet-reachable with the admin/admin123 seed
@@ -154,7 +159,10 @@ services:
     # QUIC/h2mux edge transport uses. http2 forces the edge connection over TCP 443,
     # which is open. Symptom if this is removed: registration times out with
     # "context deadline exceeded".
-    command: tunnel --no-autoupdate --protocol http2 run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env}
+    command: tunnel --no-autoupdate --protocol http2 --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared.sentinel.yml:/etc/cloudflared/config.yml:ro
+      - ${SENTINEL_CLOUDFLARED_DIR:?set SENTINEL_CLOUDFLARED_DIR in deploy/.env}:/creds:ro
     depends_on:
       nginx:
         condition: service_healthy
