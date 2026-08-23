@@ -115,7 +115,23 @@ if [ -f deploy/docker-daemon.json ] && ! cmp -s deploy/docker-daemon.json /etc/d
     install -m 0644 deploy/docker-daemon.json /etc/docker/daemon.json
     log "INFO /etc/docker/daemon.json changed — restarting dockerd (all containers bounce)"
     systemctl restart docker
-    sleep 15
+
+    # Wait for dockerd to actually answer, rather than sleeping a guessed interval.
+    # This used to be a blind `sleep 15` and it silently swallowed a whole deploy on
+    # 2026-08-23: the log ended at the INFO line above, `docker compose up -d` never
+    # ran, yet systemd still recorded status=0/SUCCESS. Containers came back on their
+    # *stored* config — dockerd restores what it had, it does not re-read compose — so
+    # the tree was at the new commit while the running containers were still the old
+    # ones. A deploy that cannot prove it reached `compose up` must not look successful.
+    dockerd_deadline=$(( $(date +%s) + 120 ))
+    until docker info >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$dockerd_deadline" ]; then
+            log "ERROR dockerd did not come back within 120s after restart — aborting deploy"
+            exit 1
+        fi
+        sleep 2
+    done
+    log "INFO dockerd back up; continuing deploy"
 fi
 
 cd "$STACK_DIR/deploy" || exit 1
