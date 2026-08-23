@@ -131,25 +131,30 @@ services:
     restart: unless-stopped
     logging: *logging
     mem_limit: 128m
-    # QUICK TUNNEL — interim, until a domain is bought and a named tunnel replaces it.
-    # Consequences you are accepting by running this form:
-    #   * The public hostname is random and CHANGES ON EVERY RESTART of this container.
-    #     Read it with: docker compose logs cloudflared | grep trycloudflare.com
-    #   * Cloudflare rate-limits quick tunnels (~200 concurrent in-flight requests,
-    #     429s past that) and states they are not for production use.
-    #   * Cloudflare Access CANNOT be applied to a quick tunnel, so there is NO auth
-    #     layer in front of the app. The admin/admin123 seed from db_setup.sql is
-    #     therefore internet-reachable — set a strong password on that account during
-    #     bring-up (see DOCKER_DEPLOY.md).
-    # To move to a named tunnel later: replace the command with
-    #   tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
-    # and point the tunnel's public hostname at http://nginx:80.
+    # NAMED TUNNEL, token-run. Serves sentinel.needlegal.in at a stable hostname; the
+    # quick tunnel it replaces re-randomised its URL on every restart of this container.
+    #
+    # This is SENTINEL's OWN tunnel and must stay that way. The NAS also runs a separate
+    # host-level cloudflared (systemd `cloudflared.service`, /etc/cloudflared/config.yml)
+    # for the probablysecure.tech zone. Do not route sentinel through that one and do not
+    # edit its config — the two zones are kept deliberately independent.
+    #
+    # Because this runs with --token, the ingress rules live in the Cloudflare Zero Trust
+    # dashboard, NOT in a local config file. The tunnel's Public Hostname must be
+    # sentinel.needlegal.in -> HTTP -> nginx:80 (container-network name; this container
+    # shares the `sentinel` network with nginx, so it does not use the host's :8080
+    # publish). Cloudflare creates the DNS record itself when that hostname is added.
+    #
+    # Cloudflare Access can be applied to a named tunnel (it cannot to a quick one). It is
+    # not enabled yet, so the app is still internet-reachable with the admin/admin123 seed
+    # from db_setup.sql — set a strong password on that account (see DOCKER_DEPLOY.md).
+    #
     # --protocol http2 is REQUIRED on this network, not a preference: the campus
     # gateway silently drops outbound TCP 7844, which is what cloudflared's default
     # QUIC/h2mux edge transport uses. http2 forces the edge connection over TCP 443,
-    # which is open. Symptom if this is removed: "failed to request quick Tunnel ...
-    # context deadline exceeded".
-    command: tunnel --no-autoupdate --protocol http2 --url http://nginx:80
+    # which is open. Symptom if this is removed: registration times out with
+    # "context deadline exceeded".
+    command: tunnel --no-autoupdate --protocol http2 run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/.env}
     depends_on:
       nginx:
         condition: service_healthy

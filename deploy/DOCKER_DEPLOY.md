@@ -88,8 +88,10 @@ trusting the Sophos CA does *not* fix this; it only makes the portal page verify
 cleanly instead of erroring.
 
 Two knock-on effects on this deploy:
-- Every lapse drops the tunnel, and the quick tunnel comes back on a **different**
-  hostname.
+- Every lapse drops the tunnel. Since the move to a named tunnel this is now
+  self-healing — the hostname is fixed, so the tunnel simply reconnects to
+  `sentinel.needlegal.in` once the portal session is back. Under the old quick tunnel
+  it came back on a *different* hostname every time.
 - Outbound **TCP 7844 is blocked** on this network, which is cloudflared's default
   QUIC edge transport. `docker-compose.yml` therefore pins `--protocol http2` (TCP 443).
   Do not remove that flag here.
@@ -134,21 +136,34 @@ not four mounted `.sql` files), plus `migration_coming_soon.sql`. There is still
 migration runner and no version tracking — a `schema_migrations` table remains a Day-4
 item, and this only handles the from-empty case.
 
-### Get the public URL
+### The public URL
 
-```bash
-docker compose logs cloudflared | grep -o 'https://.*trycloudflare.com'
-```
+**https://sentinel.needlegal.in** — stable. The rotating `*.trycloudflare.com` quick
+tunnel it replaced is gone.
 
-**This URL changes every time the `cloudflared` container restarts.** That is inherent
-to quick tunnels; it goes away when a domain is bought and a named tunnel replaces it.
+This runs on SENTINEL's **own** named tunnel, token-run by the `cloudflared` service in
+this compose file. Because it runs with `--token`, its ingress lives in the Cloudflare
+Zero Trust dashboard, **not** in any file in this repo: Networks → Tunnels → `sentinel` →
+Public Hostname `sentinel.needlegal.in` → HTTP → `nginx:80`. Cloudflare maintains the DNS
+record itself. The token is `CLOUDFLARE_TUNNEL_TOKEN` in `deploy/.env` (gitignored).
+
+> **Do not route this through the host's other cloudflared.** The NAS separately runs a
+> system `cloudflared.service` off `/etc/cloudflared/config.yml` serving the
+> `probablysecure.tech` zone. The two are deliberately independent — different tunnels,
+> different credentials. Do not add sentinel hostnames to that config.
+>
+> A `cloudflared tunnel login` cert is scoped to **one zone**. Running
+> `cloudflared tunnel route dns <tunnel> sentinel.needlegal.in` under a cert issued for
+> `probablysecure.tech` does not error — it silently creates the nonsense record
+> `sentinel.needlegal.in.probablysecure.tech` in the wrong zone. Use the dashboard.
 
 ### Immediately after first bring-up: the admin seed
 
 `db_setup.sql` seeds `admin` / `admin123`. RBAC (`role_required`) is modelled but not
 enforced, and both are deliberately deferred to the planned OAuth2 pass — see the
-Decision note in `CLAUDE.md`. A quick tunnel is public and **Cloudflare Access cannot
-be applied to it**, so there is no auth layer in front of this.
+Decision note in `CLAUDE.md`. Cloudflare Access *can* be applied to this named tunnel
+(it could not to the old quick tunnel), but it is **not enabled yet**, so there is still
+no auth layer in front of this.
 
 Set a strong password on that account as the first thing you do after the stack is up.
 This is a stopgap for a staging box, not a fix, and it does not change `db_setup.sql`.
