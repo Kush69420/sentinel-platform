@@ -159,13 +159,53 @@ services:
     # QUIC/h2mux edge transport uses. http2 forces the edge connection over TCP 443,
     # which is open. Symptom if this is removed: registration times out with
     # "context deadline exceeded".
-    command: tunnel --no-autoupdate --protocol http2 --config /etc/cloudflared/config.yml run
+    #
+    # --metrics is pinned to 127.0.0.1:20241 (loopback inside the container only, never
+    # published) so the healthcheck below has a fixed address to probe. Left unset, the
+    # flag defaults to "0.0.0.0:0" and cloudflared picks whatever's free in
+    # [20241..20245] or, if all of those are taken, a random port — `cloudflared tunnel
+    # ready` then has nothing reliable to hit. Confirmed live in the running container
+    # (2026-08-24): with no flag it happened to land on 20241, but that's not a
+    # guarantee, hence pinning it explicitly.
+    command: tunnel --no-autoupdate --protocol http2 --metrics 127.0.0.1:20241 --config /etc/cloudflared/config.yml run
     volumes:
       - ./cloudflared.sentinel.yml:/etc/cloudflared/config.yml:ro
       - ${SENTINEL_CLOUDFLARED_DIR:?set SENTINEL_CLOUDFLARED_DIR in deploy/.env}:/creds:ro
     depends_on:
       nginx:
         condition: service_healthy
+    healthcheck:
+      # cloudflared NEVER exits on its own, even with every edge connection down — it
+      # retries internally forever (confirmed in the 2026-08-23/24 incident: 4
+      # connections dropped, container stayed "Up", exit code never fired). That means
+      # `restart: unless-stopped` above has nothing to trigger on — there is no exit for
+      # Docker to react to. This healthcheck exists for OBSERVABILITY (`docker ps` /
+      # `docker compose ps`, and the health gate in sentinel-deploy.sh), NOT for restart:
+      # Docker does not restart a container just because its healthcheck goes unhealthy.
+      # The actual restart-after-sustained-failure logic lives in the host-level
+      # sentinel-cloudflared-watchdog systemd timer (deploy/systemd/), which probes
+      # independently via `docker exec ... cloudflared tunnel ready` rather than
+      # trusting this field — so it keeps working even if this healthcheck subsystem
+      # itself misbehaves. See that timer/service for the restart logic and thresholds.
+      #
+      # `tunnel ready` calls cloudflared's own /ready endpoint and maps the result to an
+      # exit code — it IS the cloudflared binary, so it runs in this distroless image
+      # where there is no shell/curl/wget. Must stay CMD (exec) form, never CMD-SHELL.
+      #
+      # interval/retries/start_period are deliberately NOT aggressive: the tunnel was
+      # observed self-healing in ~20s during the 2026-08-23 incident (all 4 edge
+      # connections dropped when caa.service's 2-hourly captive-portal renewal bounced
+      # the NAT'd container network; they re-registered ~20s later with no restart at
+      # all). Flipping to "unhealthy" on the first missed probe would make `docker ps`
+      # and the deploy health gate flap on something that was already resolving itself.
+      # 45s interval x 3 retries = ~90s of sustained failure before this reports
+      # unhealthy — comfortably past the ~20s self-heal window. DO NOT shorten this "to
+      # be more responsive" without re-reading this comment and the watchdog's.
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:20241", "ready"]
+      interval: 45s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks: [sentinel]
 
 networks:

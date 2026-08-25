@@ -1,0 +1,12 @@
+[Unit]
+Description=Probe sentinel-cloudflared readiness; restart after sustained failure
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sentinel-cloudflared-watchdog.sh
+# The probe itself is timeout-guarded inside the script (10s); this is a backstop in
+# case `docker exec`/`docker restart` itself wedges, so a stuck run cannot pile up
+# against the 45s timer cadence.
+TimeoutStartSec=30

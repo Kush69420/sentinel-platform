@@ -79,6 +79,13 @@ if [ -f deploy/caa-renew.sh ] && ! cmp -s deploy/caa-renew.sh /usr/local/bin/caa
     log "INFO updated /usr/local/bin/caa-renew.sh"
 fi
 
+# The cloudflared readiness watchdog, same pattern as caa-renew.sh above — a oneshot
+# driven by its own timer, so the next tick picks up a changed version on its own.
+if [ -f deploy/sentinel-cloudflared-watchdog.sh ] && ! cmp -s deploy/sentinel-cloudflared-watchdog.sh /usr/local/bin/sentinel-cloudflared-watchdog.sh; then
+    install -m 0755 deploy/sentinel-cloudflared-watchdog.sh /usr/local/bin/sentinel-cloudflared-watchdog.sh
+    log "INFO updated /usr/local/bin/sentinel-cloudflared-watchdog.sh"
+fi
+
 # Host-level config lives in the repo too, so that changing it is a `git push` rather
 # than an SSH session. Anything synced here must be idempotent and safe to re-apply.
 #
@@ -89,7 +96,8 @@ fi
 # mid-deploy. A changed caa.service takes effect at the next caa-renew tick.
 reload_systemd=0
 for unit in sentinel-deploy.service sentinel-deploy.timer \
-            caa.service caa-renew.service caa-renew.timer; do
+            caa.service caa-renew.service caa-renew.timer \
+            sentinel-cloudflared-watchdog.service sentinel-cloudflared-watchdog.timer; do
     [ -f "deploy/systemd/$unit" ] || continue
     if ! cmp -s "deploy/systemd/$unit" "/etc/systemd/system/$unit"; then
         install -m 0644 "deploy/systemd/$unit" "/etc/systemd/system/$unit"
@@ -105,6 +113,10 @@ if [ "$reload_systemd" -eq 1 ]; then
     # (multi-user.target), but starting it here mid-deploy would re-auth and
     # drop the link out from under this very run.
     systemctl enable caa-renew.service >/dev/null 2>&1
+    # --now is safe here (unlike caa-renew.service above): a probe run mid-deploy just
+    # takes the deploy lock non-blocking and skips (see sentinel-cloudflared-watchdog.sh),
+    # it does not touch the network or anything deploy-sensitive.
+    systemctl enable --now sentinel-cloudflared-watchdog.timer >/dev/null 2>&1
 fi
 
 # Docker daemon settings — notably the explicit DNS servers, without which BuildKit
