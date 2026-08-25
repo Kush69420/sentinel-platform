@@ -199,7 +199,7 @@ This is a stopgap for a staging box, not a fix, and it does not change `db_setup
 The NAS runs continuous deployment. **`git push` is the deploy** — you should not need
 to SSH in to ship a change.
 
-`sentinel-deploy.timer` fires every 3 minutes and runs `sentinel-deploy.sh`, which
+`sentinel-deploy.timer` fires every 10 minutes and runs `sentinel-deploy.sh`, which
 pulls the tracked branch when it moves, rebuilds, and waits for every service to come
 back healthy. If the build fails or the stack does not go healthy within
 `SENTINEL_HEALTH_TIMEOUT` (default 180s), it resets to the previous commit and rebuilds
