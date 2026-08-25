@@ -1,0 +1,38 @@
+# Ingress for SENTINEL's own Cloudflare tunnel.
+#
+# This tunnel is run LOCALLY-managed (credentials file + this config) rather than with
+# --token. With --token, cloudflared pulls its ingress from the Zero Trust dashboard, so
+# the routing lives behind a UI tab and is invisible to code review. Keeping it here
+# means the route is in git, diffable, and deploys with the rest of the stack.
+#
+# The credentials file is NOT in git. It is derived from CLOUDFLARE_TUNNEL_TOKEN and
+# lives on the host at $SENTINEL_CLOUDFLARED_DIR, mounted read-only at /creds. It must be
+# owned by uid 65532 (the cloudflared image's nonroot user) or the tunnel cannot read it.
+#
+# DNS is the one piece Cloudflare will not create for us in this mode: the zone needs a
+# CNAME `sentinel` -> <tunnel-id>.cfargotunnel.com, and it MUST be proxied (orange
+# cloud). A grey-cloud record resolves to nothing usable.
+#
+# Do not confuse this with /etc/cloudflared/config.yml on the NAS host, which belongs to
+# a completely separate systemd cloudflared serving the probablysecure.tech zone. The two
+# tunnels are deliberately independent — different tunnel, different credentials.
+
+tunnel: 94b79c7c-4112-4d79-aac0-a7d19b5dbd22
+credentials-file: /creds/94b79c7c-4112-4d79-aac0-a7d19b5dbd22.json
+
+no-autoupdate: true
+
+originRequest:
+  connectTimeout: 30s
+
+ingress:
+  # nginx is reachable by service name: cloudflared shares the `sentinel` compose
+  # network with it, so this does not go via the host's 127.0.0.1:8080 publish.
+  - hostname: sentinel.needlegal.in
+    service: http://nginx:80
+    originRequest:
+      # /api/events is Server-Sent Events. disableChunkedEncoding is deliberately NOT
+      # set here — it would buffer the stream and break SSE. noHappyEyeballs likewise
+      # left default. If SSE regresses, look here first.
+      noTLSVerify: false
+  - service: http_status:404

@@ -11,3 +11,4 @@ output.pdf
 node_modules/
 *.html.bak-*
 .claude/
+deploy/app.env

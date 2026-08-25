@@ -1,0 +1,31 @@
+[Unit]
+Description=Run the sentinel-cloudflared readiness watchdog every 45s
+
+[Timer]
+# 45s cadence, matching the compose healthcheck's interval (see docker-compose.yml):
+# the tunnel was observed self-healing in ~20s during the 2026-08-23 incident (all 4
+# edge connections dropped when caa.service's 2-hourly captive-portal renewal bounced
+# the container's NAT'd network path, then re-registered on their own with no restart).
+# A `docker restart` costs ~10s of guaranteed downtime plus fresh edge registration on
+# top — worse than the self-heal it would be "fixing". The watchdog script itself
+# requires 3 consecutive failed probes spanning >=90s (FAILURE_THRESHOLD /
+# MIN_FAILURE_SPAN in sentinel-cloudflared-watchdog.sh) before it actually restarts
+# anything; at this 45s cadence that means the earliest possible restart is ~90s into a
+# real outage, comfortably past the ~20s self-heal window.
+#
+# DO NOT shorten OnUnitActiveSec, or the threshold in the script, "to be more
+# responsive" without re-reading the above — a first-failure trigger is the exact
+# mistake this timer was built to avoid.
+OnBootSec=2min
+OnUnitActiveSec=45s
+# Persistent=true is deliberately NOT set here, unlike sentinel-deploy.timer: it exists
+# to catch up a timer whose trigger was missed while the box was off, which matters for
+# a 3-minute-or-slower cadence but is a no-op in practice at 45s — the next tick is
+# never more than 45s away regardless, and there is nothing useful to "catch up" (no
+# missed probe is worth acting on after the fact; only a live, sustained failure is).
+# What actually gets this timer through a reboot is WantedBy=timers.target below plus
+# `systemctl enable`, applied by sentinel-deploy.sh the same way as every other unit in
+# this directory.
+
+[Install]
+WantedBy=timers.target

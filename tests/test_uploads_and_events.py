@@ -13,6 +13,7 @@
 """
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,9 +26,25 @@ class UploadsPathTraversalTest(unittest.TestCase):
         app_module.app.config["TESTING"] = True
         self.client = app_module.app.test_client()
 
+        # Everything this test writes goes in a temp tree, not next to app.py.
+        # The container image runs as a non-root uid against a root-owned /app,
+        # so writing into BASE_DIR fails with PermissionError there — correctly.
+        # UPLOAD_FOLDER is read as a module global by the /uploads route, so
+        # repointing it here is enough to redirect the route at the temp tree.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = self._tmp.name
+
+        self._orig_upload_folder = app_module.UPLOAD_FOLDER
+        app_module.UPLOAD_FOLDER = os.path.join(base, "uploads")
+        os.makedirs(app_module.UPLOAD_FOLDER, exist_ok=True)
+        self.addCleanup(
+            setattr, app_module, "UPLOAD_FOLDER", self._orig_upload_folder
+        )
+
         # A "secret" file living outside UPLOAD_FOLDER, sibling to it, that a
         # traversal segment might try to reach.
-        self.secret_path = os.path.join(app_module.BASE_DIR, "day2_traversal_secret.txt")
+        self.secret_path = os.path.join(base, "day2_traversal_secret.txt")
         with open(self.secret_path, "w", encoding="utf-8") as fh:
             fh.write("outside the upload folder")
 
@@ -37,13 +54,6 @@ class UploadsPathTraversalTest(unittest.TestCase):
         self.legit_path = os.path.join(app_module.UPLOAD_FOLDER, self.legit_name)
         with open(self.legit_path, "wb") as fh:
             fh.write(b"\x89PNG\r\n not a real png but bytes are bytes")
-
-    def tearDown(self):
-        for p in (self.secret_path, self.legit_path):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
 
     def _login_admin(self):
         with self.client.session_transaction() as sess:

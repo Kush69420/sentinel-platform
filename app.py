@@ -49,6 +49,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from flask import (
     Flask,
     Response,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
@@ -59,6 +60,14 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
+
+try:
+    import psutil
+except ImportError:
+    # Optional: /api/admin/health reports storage from shutil.disk_usage regardless,
+    # and simply omits cpu_percent/ram_percent when psutil is unavailable. It is in
+    # requirements.txt, so this only bites a partially-installed environment.
+    psutil = None
 
 load_dotenv()
 
@@ -644,16 +653,32 @@ def _json_clean(row):
     return out
 
 def log_activity(admin_id, action: str, description: str):
+    # The caller never passes an IP: it is taken from the live request here so that
+    # every logged action fills activity_log.ip_address, not just the handful that
+    # happen to interpolate it into the free-text description. Outside a request
+    # (startup, background work) there is no peer address and the column stays NULL.
+    ip = _client_ip() if has_request_context() else None
     try:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO activity_log (admin_id, action, description, created_at)
-            VALUES (%s,%s,%s,NOW())
-            """,
-            (admin_id, action, description),
-        )
+        try:
+            cursor.execute(
+                """
+                INSERT INTO activity_log (admin_id, action, description, ip_address, created_at)
+                VALUES (%s,%s,%s,%s,NOW())
+                """,
+                (admin_id, action, description, ip or None),
+            )
+        except mysql.connector.Error:
+            # ip_address arrives via migration_admin_customization.sql; fall back for
+            # schemas that predate it rather than losing the log line entirely.
+            cursor.execute(
+                """
+                INSERT INTO activity_log (admin_id, action, description, created_at)
+                VALUES (%s,%s,%s,NOW())
+                """,
+                (admin_id, action, description),
+            )
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -2676,17 +2701,11 @@ def mobile_lookup_report_pdf(search_log_id):
     query_value = log.get("query_value") or ""
     cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query_value,))
     record = cursor.fetchone()
-    if not record:
-        cursor.execute(
-            "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND (record_key=%s OR data_json LIKE %s) ORDER BY created_at DESC LIMIT 1",
-            (query_value, f"%{query_value}%"),
-        )
-        fallback = cursor.fetchone()
-        if fallback:
-            try:
-                record = json.loads(fallback.get("data_json") or "{}")
-            except Exception:
-                record = {}
+    # subscriber_records is the single source of truth for mobile_lookup. The old
+    # master_data_records fallback is gone: `data_json LIKE '%query%'` on an unindexed
+    # JSON blob is an unindexable full table scan, and the OR beside it also stopped
+    # record_key's index from being used — a per-report scan of the whole table once
+    # real volume lands. It was invisible only because the table is empty today.
     conn.close()
     if not record:
         return jsonify({"error": "Underlying subscriber record no longer exists."}), 404
