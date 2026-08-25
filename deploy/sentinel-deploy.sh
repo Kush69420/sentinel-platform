@@ -14,7 +14,7 @@
 set -uo pipefail
 
 STACK_DIR="${SENTINEL_STACK_DIR:?set SENTINEL_STACK_DIR in /etc/sentinel-deploy.conf}"
-BRANCH="${SENTINEL_BRANCH:-worktree-frontend-prod-hygiene}"
+BRANCH="${SENTINEL_BRANCH:-main}"
 LOG=/var/log/sentinel-deploy.log
 HEALTH_TIMEOUT="${SENTINEL_HEALTH_TIMEOUT:-180}"
 
@@ -26,6 +26,17 @@ exec 9>/var/lock/sentinel-deploy.lock
 flock -n 9 || { log "SKIP another deploy is already running"; exit 0; }
 
 cd "$STACK_DIR" || { log "ERROR stack dir $STACK_DIR missing"; exit 1; }
+
+# Deploying tracks whatever branch the checkout is actually on, so a mismatch between
+# that and $BRANCH would fast-forward the wrong branch to $BRANCH's tip and leave the
+# box on a misleadingly-named branch. Fail loudly rather than switching automatically:
+# a switch here could quietly discard work done directly on the box.
+CURRENT=$(git rev-parse --abbrev-ref HEAD)
+if [ "$CURRENT" != "$BRANCH" ]; then
+    log "ERROR checkout is on '$CURRENT' but deploying '$BRANCH'."
+    log "      Switch it once with: cd $STACK_DIR && git checkout $BRANCH"
+    exit 1
+fi
 
 # A failed fetch is almost always the campus network session having lapsed rather than
 # anything wrong with the deploy. Exit quietly and let the next tick retry — thrashing
