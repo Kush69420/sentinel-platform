@@ -129,6 +129,30 @@ docker compose up -d --build
 docker compose logs -f mysql    # first boot applies the schema; wait for healthy
 ```
 
+> **If `SENTINEL_UPLOADS_DIR` is an OMV shared folder** (true on this NAS —
+> `reed/sentinel/uploads`), `prepare-host.sh`'s `chown` is not enough on its own, and
+> gov-ID upload (`POST /api/lea/register`) will fail every time with
+> `PermissionError: [Errno 13] Permission denied` even though the container "owns" the
+> directory. OMV shared folders carry a POSIX ACL with a `mask` entry that strips
+> read/execute/write from every *named* user/group ACL entry — only the folder's
+> actual owner entry (`user::rwx`) escapes the mask. Confirm with `getfacl
+> "$SENTINEL_UPLOADS_DIR"`: if you see `mask::-w-` (or anything less than `rwx`) and a
+> line like `user:10001:rwx	#effective:-w-`, this is it.
+>
+> The fix is `deploy/docker-compose.yml`'s `user:` override on the `app` service
+> (`SENTINEL_APP_UID`/`SENTINEL_APP_GID`, both in `.env`): set them to the shared
+> folder's *actual* owning uid/gid (`stat -c '%u %g' "$SENTINEL_UPLOADS_DIR"`) instead
+> of the image's default 10001:10001, so the container's uid lands on the ACL's owner
+> entry rather than a named one that the mask guts. On this NAS that's
+> `SENTINEL_APP_UID=1000` / `SENTINEL_APP_GID=100` (kush:users). This is deliberately
+> *not* solved with a one-off host-side `chown`/`setfacl`: OMV re-applies the shared
+> folder's configured owner/ACL whenever its Shared Folders privileges are edited in
+> the web UI, silently reverting any manual chown and reintroducing the bug with
+> nothing in this repo explaining why. Matching the container to whatever OMV already
+> keeps the folder owned as survives that, because it stops fighting OMV instead of
+> trying to out-chown it. Recreate the app container after changing `.env`:
+> `docker compose up -d app`.
+
 On first boot only, MySQL initialises an empty datadir and
 `db-init/00-apply-schema.sh` applies the four schema files **in the dependency order
 `CLAUDE.md` specifies** (the order is not alphabetical, which is why it is a script and

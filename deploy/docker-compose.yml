@@ -80,6 +80,20 @@ services:
       # Exactly one trusted hop: nginx emits a single X-Forwarded-For value after the
       # realip module has recovered the true client. See nginx.docker.conf.
       TRUSTED_PROXY_COUNT: "1"
+    # Run as the uploads dir's actual owner instead of the image's baked-in uid 10001.
+    # SENTINEL_UPLOADS_DIR is an OMV shared folder, and OMV shared folders carry a
+    # POSIX ACL with an owner entry (uid/gid of whoever owns the share, e.g. 1000:100)
+    # plus a mask that strips rwx from every OTHER named-user/group entry — so even
+    # `chown 10001:10001` on the dir is not enough by itself, because the mask still
+    # guts any *named* ACL entry for uid 10001. The owner entry is the one thing the
+    # mask never restricts, so matching the container's uid to the real directory owner
+    # is what actually works, and it keeps working after OMV re-applies the share's ACL
+    # (which resets ownership back to the share's configured owner, not to 10001).
+    # Defaults to the Dockerfile's built-in `sentinel` user (10001:10001) so a plain
+    # `docker compose up` with no override still runs non-root and matches the image's
+    # own `chown -R sentinel:sentinel /app/uploads`. Override in deploy/.env to match
+    # SENTINEL_UPLOADS_DIR's actual owner — see DOCKER_DEPLOY.md.
+    user: "${SENTINEL_APP_UID:-10001}:${SENTINEL_APP_GID:-10001}"
     volumes:
       # Encrypted gov-ID uploads live on the btrfs RAID1 pool — they are irreplaceable
       # and small, so mirroring costs nothing meaningful here.

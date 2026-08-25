@@ -19,17 +19,36 @@ if [[ ! -f .env ]]; then
 fi
 set -a; . ./.env; set +a
 
-# UIDs are fixed, not looked up: 999 is the mysql user inside mysql:8.4, and 10001 is
-# the sentinel user created in the Dockerfile. Both are pinned there for this reason.
+# 999 is fixed: it's the mysql user inside mysql:8.4, pinned there by that image.
+# APP_UID/APP_GID are NOT hardcoded — they follow SENTINEL_APP_UID/SENTINEL_APP_GID
+# from .env (docker-compose.yml passes the same two vars as `user:` on the app
+# service), because the right value depends on what SENTINEL_UPLOADS_DIR actually is:
+#   - a plain directory: 10001:10001 (the `sentinel` user baked into the Dockerfile,
+#     matching the image's own `chown -R sentinel:sentinel /app/uploads`) is correct,
+#     and the chown below is durable.
+#   - an OMV shared folder (true on this NAS — reed/sentinel/uploads): OMV shared
+#     folders carry a POSIX ACL whose mask strips rwx from every named-user/group
+#     entry except the folder's actual owner (confirmed via getfacl: mask::-w- guts
+#     `user:10001:rwx` down to `-w-`, so `chown 10001:10001` alone leaves the app
+#     unable to open() the directory even though it "owns" it). The chown/chmod below
+#     are then only a best-effort convenience for the fresh-directory case and do NOT
+#     survive OMV re-applying the shared folder's ACL from its web UI, which resets
+#     ownership back to whatever the share is configured for (kush:users on this NAS),
+#     undoing this script's chmod along with it. The actual fix in that case is
+#     SENTINEL_APP_UID/SENTINEL_APP_GID matching the shared folder's real owner (`stat
+#     -c '%u %g' "$SENTINEL_UPLOADS_DIR"`) so the app container's uid lands on the
+#     ACL's owner entry instead of a named entry — see DOCKER_DEPLOY.md and the `user:`
+#     comment in docker-compose.yml.
 MYSQL_UID=999
-APP_UID=10001
+APP_UID="${SENTINEL_APP_UID:-10001}"
+APP_GID="${SENTINEL_APP_GID:-10001}"
 
 mkdir -p "$SENTINEL_MYSQL_DIR" "$SENTINEL_UPLOADS_DIR" "$SENTINEL_BACKUPS_DIR"
 
 chown "$MYSQL_UID:$MYSQL_UID" "$SENTINEL_MYSQL_DIR"
 chmod 700 "$SENTINEL_MYSQL_DIR"
 
-chown "$APP_UID:$APP_UID" "$SENTINEL_UPLOADS_DIR"
+chown "$APP_UID:$APP_GID" "$SENTINEL_UPLOADS_DIR"
 chmod 700 "$SENTINEL_UPLOADS_DIR"
 
 # Backups contain a full dump of the database — same sensitivity as the datadir.
