@@ -146,11 +146,77 @@ if [ -f deploy/docker-daemon.json ] && ! cmp -s deploy/docker-daemon.json /etc/d
     log "INFO dockerd back up; continuing deploy"
 fi
 
+# Decide whether this deploy actually needs `docker compose --build`. The Dockerfile
+# does `COPY . .` from the repo root, so the honest default is "assume everything
+# rebuilds a real image layer" — this only skips --build for paths verified to be
+# genuinely inert: excluded from the build context entirely by .dockerignore
+# (deploy/, .gitignore), or copied in but never read at runtime (*.md, plans/, a
+# hypothetical docs/ or .github/). A compose-only or systemd-only commit lands
+# entirely under deploy/, so it hits this and skips the rebuild machinery outright.
+# Bias hard toward rebuilding: stale code in prod is far worse than a wasted build,
+# so a missing local image, a failed/empty diff, or any path outside the inert set
+# all force a rebuild.
+build_irrelevant_path() {
+    case "$1" in
+        deploy/*|.github/*|docs/*|plans/*|*.md|.gitignore) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+DO_BUILD=1
+BUILD_REASON="default (bias toward rebuild)"
+
+if ! docker image inspect sentinel-app:local >/dev/null 2>&1; then
+    BUILD_REASON="no local sentinel-app:local image present (first deploy?)"
+elif CHANGED=$(git diff --name-only "$LOCAL" "$REMOTE" 2>>"$LOG"); then
+    if [ -z "$CHANGED" ]; then
+        BUILD_REASON="git diff ${LOCAL:0:8}..${REMOTE:0:8} returned no paths (ambiguous)"
+    else
+        DO_BUILD=0
+        TRIGGERS=""
+        while IFS= read -r changed_file; do
+            [ -n "$changed_file" ] || continue
+            if build_irrelevant_path "$changed_file"; then
+                continue
+            fi
+            DO_BUILD=1
+            TRIGGERS="$TRIGGERS $changed_file"
+        done <<<"$CHANGED"
+        if [ "$DO_BUILD" -eq 1 ]; then
+            BUILD_REASON="paths outside the known-inert set changed:$TRIGGERS"
+        else
+            # Intentional word-splitting: $CHANGED is one path per line, folded into
+            # a single space-separated log line.
+            # shellcheck disable=SC2086
+            BUILD_REASON="only known-inert paths changed:$(printf ' %s' $CHANGED)"
+        fi
+    fi
+else
+    BUILD_REASON="git diff ${LOCAL:0:8}..${REMOTE:0:8} failed (shallow clone? force-push? unrelated history?) — forcing rebuild"
+fi
+
+BUILD_FLAGS=()
+if [ "$DO_BUILD" -eq 1 ]; then
+    log "REBUILD ${BUILD_REASON}"
+    BUILD_FLAGS=(--build)
+else
+    log "NO-BUILD ${BUILD_REASON}"
+fi
+
+# CPU/IO niceness: 4 cores and spinning rust, and this can run under load from
+# whatever else the box is doing. Degrade to nice-only if ionice isn't installed.
+if command -v ionice >/dev/null 2>&1; then
+    NICE_PREFIX=(nice -n 19 ionice -c 3)
+else
+    log "WARN ionice not found on this host; running compose up with nice only"
+    NICE_PREFIX=(nice -n 19)
+fi
+
 cd "$STACK_DIR/deploy" || exit 1
-if ! docker compose up -d --build >>"$LOG" 2>&1; then
+if ! "${NICE_PREFIX[@]}" docker compose up -d "${BUILD_FLAGS[@]}" >>"$LOG" 2>&1; then
     log "ERROR build/up failed — rolling back to ${LOCAL:0:8}"
     cd "$STACK_DIR" && git reset -q --hard "$LOCAL"
-    cd "$STACK_DIR/deploy" && docker compose up -d --build >>"$LOG" 2>&1
+    cd "$STACK_DIR/deploy" && "${NICE_PREFIX[@]}" docker compose up -d --build >>"$LOG" 2>&1
     log "ROLLBACK complete at ${LOCAL:0:8}"
     exit 1
 fi
@@ -172,6 +238,6 @@ done
 log "ERROR services did not become healthy within ${HEALTH_TIMEOUT}s — rolling back to ${LOCAL:0:8}"
 docker compose ps --format '{{.Name}} {{.Status}}' >> "$LOG"
 cd "$STACK_DIR" && git reset -q --hard "$LOCAL"
-cd "$STACK_DIR/deploy" && docker compose up -d --build >>"$LOG" 2>&1
+cd "$STACK_DIR/deploy" && "${NICE_PREFIX[@]}" docker compose up -d --build >>"$LOG" 2>&1
 log "ROLLBACK complete at ${LOCAL:0:8}"
 exit 1
