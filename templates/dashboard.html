@@ -169,6 +169,23 @@ async function sendAI(){const v=aiText.value.trim();if(!v)return;messages.insert
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}function escapeHtml(s){return esc(s)}
 function toastMsg(m,type){toast.textContent=m;toast.style.display='block';toast.style.borderColor=type==='error'?'var(--red)':'var(--green)';toast.style.color=type==='error'?'var(--red)':'var(--green)';clearTimeout(window.tto);window.tto=setTimeout(()=>toast.style.display='none',2800)}
 
+/* Print an already-paid-for lookup as a PDF. Charges nothing and creates no new
+   search_logs row — the route just re-reads the existing one, scoped to the caller.
+   Fetched rather than opened directly so a failure shows the server's reason instead
+   of navigating away to a raw error page or saving a file full of JSON. The common
+   failure is a 404: the report prints from subscriber_records, so a hit that came
+   from the uploaded-master-data path has nothing to print from. */
+async function downloadLookupPdf(id){
+  try{
+    const r=await fetch(`/api/tools/run/report/pdf/${Number(id)}`);
+    if(!r.ok){const d=await r.json().catch(()=>({}));toastMsg(d.error||'Could not generate the PDF report','error');return}
+    const blob=await r.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download=`sentinel_mobile_lookup_${Number(id)}.pdf`;document.body.appendChild(a);a.click();
+    a.remove();URL.revokeObjectURL(url);
+    toastMsg('PDF report downloaded');
+  }catch(e){toastMsg('Backend not reachable.','error')}
+}
+
 function prettyLabel(k){return esc(String(k).replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase()))}
 
 /* Render a result as labelled rows rather than a raw JSON dump. Falls back to
@@ -224,7 +241,9 @@ async function runGenericTool(code){
     if(r.ok&&d.success){
       const charged=(d.credits_charged!==undefined)
         ? `<div class="muted" style="font-size:12px;margin-bottom:12px">Charged ${esc(d.credits_charged)} credit(s) · ${esc(d.credits_remaining)} remaining</div>` : '';
-      toolResult.innerHTML=charged+(d.results||[]).map(resultCard).join('')+
+      const pdfBtn=(d.search_log_id!==undefined&&d.search_log_id!==null)
+        ? `<div style="margin-top:12px"><button class="btn" onclick="downloadLookupPdf(${Number(d.search_log_id)})">⬇ DOWNLOAD PDF REPORT</button></div>` : '';
+      toolResult.innerHTML=charged+(d.results||[]).map(resultCard).join('')+pdfBtn+
         (d.errors&&d.errors.length?`<div class="muted" style="font-size:12px">${esc(d.errors.join(' · '))}</div>`:'');
       refreshAccount();
       return;
