@@ -3377,7 +3377,10 @@ def validate_import_rows(module, rows, mapping=None):
         raw=_normalize_row(orig); row={}
         if mapping:
             for dest,src in mapping.items(): row[dest]=raw.get(_norm_header(src),'')
-        else: row=raw
+        # A copy, not the mapping itself: `row['_raw']=raw` on the same object
+        # would make it self-referential, and every importer below serialises
+        # `row['_raw']` with json.dumps -> ValueError: Circular reference detected.
+        else: row=dict(raw)
         row['_raw']=raw
         for req in cfg.get('required',[]):
             if not row.get(req): issues.append({'row':i,'type':'missing_required','field':req,'message':f'Missing mandatory field: {req}'})
