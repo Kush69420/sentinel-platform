@@ -336,6 +336,21 @@ def role_required(*roles):
 # ─────────────────────────────────────────────
 CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
+# Entry points that mint a session (and with it a token) rather than acting on
+# one. Enforcing CSRF here is what locked users out: a browser that still held
+# a session cookie from before this feature shipped — or any session whose
+# token was lost — got a 403 on the very POST that would have issued a fresh
+# token, and the only escape was clearing cookies by hand. There is nothing to
+# protect on these routes anyway: a forged login/signup/password-reset grants
+# the attacker nothing the victim's session had.
+CSRF_EXEMPT_ENDPOINTS = frozenset({
+    "user_login",
+    "user_signup",
+    "admin_login",
+    "user_password_reset_request",
+    "user_password_reset_confirm",
+})
+
 
 def _new_csrf_token() -> str:
     return secrets.token_urlsafe(32)
@@ -345,11 +360,22 @@ def _new_csrf_token() -> str:
 def _enforce_csrf():
     if request.method in CSRF_SAFE_METHODS:
         return None
+    if request.endpoint in CSRF_EXEMPT_ENDPOINTS:
+        return None
     if not (session.get("is_user") or session.get("is_admin")):
         return None  # no authenticated session to forge yet
     expected = session.get("csrf_token")
+    if not expected:
+        # An authenticated session carrying no token cannot ever satisfy this
+        # check, so rejecting it means every state-changing request fails
+        # forever. Drop the unusable session instead and let the request fall
+        # through to the normal auth decorators, which answer 401 and send the
+        # frontend back to a login that works. Still fails closed — the request
+        # proceeds unauthenticated, so it gets no more than an anonymous caller.
+        session.clear()
+        return None
     provided = request.headers.get("X-CSRF-Token", "")
-    if not expected or not provided or not hmac.compare_digest(str(expected), provided):
+    if not provided or not hmac.compare_digest(str(expected), provided):
         return jsonify({"error": "CSRF token missing or invalid. Refresh the page and try again."}), 403
     return None
 
