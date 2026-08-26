@@ -678,11 +678,25 @@ def _json_clean(row):
         out[k]=v.isoformat() if hasattr(v,"isoformat") else v
     return out
 
-def log_activity(admin_id, action: str, description: str):
-    # The caller never passes an IP: it is taken from the live request here so that
-    # every logged action fills activity_log.ip_address, not just the handful that
-    # happen to interpolate it into the free-text description. Outside a request
-    # (startup, background work) there is no peer address and the column stays NULL.
+def log_activity(actor_id, action: str, description: str, actor_type: str = "admin"):
+    """Write one row to activity_log on behalf of whoever performed the action.
+
+    The actor is deliberately split into `actor_type` + `actor_id` rather than
+    being a single id, because activity_log.admin_id carries a foreign key to
+    admin_users(id) (db_setup.sql). A bot_users id passed into that column is
+    rejected by MySQL with error 1452 (foreign key constraint fails), and since
+    the insert below is wrapped in try/except the row is then dropped in
+    silence — which is exactly how the platform ended up with no user-side audit
+    trail at all. Only an admin identity may reach admin_id; every other actor
+    is recorded through actor_type/actor_id, which have no FK (both added by
+    migration_admin_customization.sql, same pair log_audit() already writes).
+
+    The caller never passes an IP: it is taken from the live request here so that
+    every logged action fills activity_log.ip_address, not just the handful that
+    happen to interpolate it into the free-text description. Outside a request
+    (startup, background work) there is no peer address and the column stays NULL.
+    """
+    admin_id = actor_id if actor_type == "admin" else None
     ip = _client_ip() if has_request_context() else None
     try:
         conn = get_db()
@@ -690,14 +704,19 @@ def log_activity(admin_id, action: str, description: str):
         try:
             cursor.execute(
                 """
-                INSERT INTO activity_log (admin_id, action, description, ip_address, created_at)
-                VALUES (%s,%s,%s,%s,NOW())
+                INSERT INTO activity_log (admin_id, action, description, ip_address, actor_type, actor_id, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,NOW())
                 """,
-                (admin_id, action, description, ip or None),
+                (admin_id, action, description, ip or None, actor_type, actor_id),
             )
         except mysql.connector.Error:
-            # ip_address arrives via migration_admin_customization.sql; fall back for
-            # schemas that predate it rather than losing the log line entirely.
+            # ip_address/actor_type/actor_id arrive via migration_admin_customization.sql;
+            # fall back for schemas that predate them rather than losing the log line
+            # entirely. Note this passes the *computed* admin_id (None for non-admin
+            # actors), never the raw actor_id: "recovering" by putting a bot_users id
+            # back into the FK column would just re-create the 1452 this function exists
+            # to avoid, and lose the row anyway. On a legacy schema a user action is
+            # therefore recorded without its actor id, which beats not recording it.
             cursor.execute(
                 """
                 INSERT INTO activity_log (admin_id, action, description, created_at)
@@ -1013,7 +1032,7 @@ def lea_register():
     conn.close()
 
     application_id = f"LEA-{datetime.now().year}-{new_id:04d}"
-    log_activity(account["id"], "lea_verification_submitted", f"{account.get('name')} submitted {application_id}")
+    log_activity(account["id"], "lea_verification_submitted", f"{account.get('name')} submitted {application_id}", actor_type="user")
     return jsonify({"success": True, "application_id": application_id, "verification_status": "pending"}), 200
 
 
@@ -1089,7 +1108,7 @@ def user_signup():
         return jsonify({"error": "An account already exists for that phone or email. Try signing in."}), 409
     conn.close()
 
-    log_activity(user_id, "user_signup", f"{name} <{email}> signed up from {ip}")
+    log_activity(user_id, "user_signup", f"{name} <{email}> signed up from {ip}", actor_type="user")
 
     session.clear()
     session.permanent = True
@@ -1201,14 +1220,14 @@ def user_login():
                 )
                 conn.commit()
                 conn.close()
-                log_activity(user["id"], "user_account_locked", f"User {identifier} locked after {failed_count} failed attempts from {ip}")
+                log_activity(user["id"], "user_account_locked", f"User {identifier} locked after {failed_count} failed attempts from {ip}", actor_type="user")
                 return jsonify({"error": f"Account locked for {lockout_hours} hours after too many failed attempts.", "locked": True}), 423
             cursor.execute("UPDATE bot_users SET failed_login_count=%s WHERE id=%s", (failed_count, user["id"]))
             conn.commit()
         except Exception:
             pass
         conn.close()
-        log_activity(user["id"], "failed_login", f"Failed login for {identifier} from {ip} ({failed_count}/{limit})")
+        log_activity(user["id"], "failed_login", f"Failed login for {identifier} from {ip} ({failed_count}/{limit})", actor_type="user")
         return jsonify({"error": "Invalid credentials"}), 401
 
     if user.get("twofa_enabled"):
@@ -1226,7 +1245,7 @@ def user_login():
                 conn.close()
                 return jsonify({"error": "Invalid 2FA code", "twofa_required": True}), 401
             conn.commit()
-            log_activity(user["id"], "recovery_code_used", f"Recovery code consumed at login from {ip}")
+            log_activity(user["id"], "recovery_code_used", f"Recovery code consumed at login from {ip}", actor_type="user")
 
     # Successful login — reset counter
     try:
@@ -1248,7 +1267,7 @@ def user_login():
     session["user_login_at"] = datetime.utcnow().isoformat()
     session["csrf_token"] = _new_csrf_token()
 
-    log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}")
+    log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}", actor_type="user")
 
     return jsonify({
         "success": True,
@@ -1270,7 +1289,7 @@ def user_login():
 @app.route("/api/user/logout", methods=["POST"])
 @user_required
 def user_logout():
-    log_activity(session.get("user_id"), "user_logout", f"{session.get('user_name', 'User')} logged out from {_client_ip()}")
+    log_activity(session.get("user_id"), "user_logout", f"{session.get('user_name', 'User')} logged out from {_client_ip()}", actor_type="user")
     for key in ["is_user", "user_id", "user_phone", "user_name", "user_department", "user_login_at"]:
         session.pop(key, None)
     return jsonify({"success": True})
@@ -1339,7 +1358,8 @@ def user_password_reset_request():
             row = cursor.fetchone()
             if row:
                 log_activity(row["id"], "password_reset_requested",
-                             f"{row.get('name') or identifier} requested a password reset from {_client_ip()}")
+                             f"{row.get('name') or identifier} requested a password reset from {_client_ip()}",
+                             actor_type="user")
     except Exception:
         pass
     return jsonify(generic)
@@ -1378,7 +1398,7 @@ def user_password_reset_confirm():
     conn.commit()
     conn.close()
 
-    log_activity(user_id, "password_reset_completed", f"Password set via reset code from {_client_ip()}")
+    log_activity(user_id, "password_reset_completed", f"Password set via reset code from {_client_ip()}", actor_type="user")
     return jsonify({"success": True, "message": "Password updated. You can now sign in.", "redirect": "/login"})
 
 
@@ -2177,7 +2197,7 @@ def user_password_change():
     )
     conn.commit()
     conn.close()
-    log_activity(session.get("user_id"), "password_changed", f"Password changed from {_client_ip()}")
+    log_activity(session.get("user_id"), "password_changed", f"Password changed from {_client_ip()}", actor_type="user")
     return jsonify({"success": True})
 
 
@@ -2927,17 +2947,63 @@ def admin_data_preview():
     return jsonify({"success": True, "headers": headers, "total_rows": len(rows), "preview": rows[:10]})
 
 
+# MySQL error numbers we treat as "this deployment never created that table/column".
+# `errorcode` is not imported in this module (and `import mysql.connector` alone does
+# not reliably expose `mysql.connector.errorcode`), so the numbers are named here.
+_ER_BAD_FIELD_ERROR = 1054
+_ER_NO_SUCH_TABLE = 1146
+
+# Every table an import batch can write rows into, all keyed on import_batch_id:
+# master_data_records is the legacy generic store (admin_data_upload), the rest are
+# the per-module tables the current wizard (import_execute_v2) writes.
+_IMPORT_ROLLBACK_TABLES = ("cdr_records", "ipdr_records", "subscriber_records", "vehicle_records", "bts_tower_records", "master_data_records")
+
+
+def _rollback_delete(cursor, table, batch_id):
+    """DELETE one batch's rows from `table`; return rows deleted, or None if the table/column doesn't exist here."""
+    try: cursor.execute(f"DELETE FROM {table} WHERE import_batch_id=%s", (batch_id,))
+    except mysql.connector.Error as exc:
+        if getattr(exc, "errno", None) in (_ER_NO_SUCH_TABLE, _ER_BAD_FIELD_ERROR): return None
+        raise
+    return max(cursor.rowcount or 0, 0)
+
+
 @app.route("/api/admin/data/rollback/<int:batch_id>", methods=["POST"])
 @admin_required
 def rollback_import(batch_id):
-    conn = get_db(); cursor = conn.cursor()
-    try: cursor.execute("DELETE FROM master_data_records WHERE import_batch_id=%s", (batch_id,))
-    except mysql.connector.Error: cursor.execute("DELETE FROM master_data_records WHERE id=0")
-    deleted = cursor.rowcount
-    try: cursor.execute("UPDATE import_batches SET status='rolled_back', rolled_back_at=NOW() WHERE id=%s", (batch_id,))
-    except Exception: pass
-    conn.commit(); conn.close(); log_audit("data_import_rollback", f"Rolled back import batch {batch_id}", None, {"deleted": deleted})
-    return jsonify({"success": True, "deleted": deleted})
+    """Undo an import batch: delete its rows everywhere, and mark the batch rolled_back.
+
+    This used to be two view functions bound to the *same* url rule. The one Flask
+    actually dispatched (registered first) deleted only from `master_data_records` --
+    the legacy table -- while the live wizard (`import_execute_v2`) writes to
+    subscriber/vehicle/bts/cdr/ipdr `_records`. Worse, its `except mysql.connector.Error`
+    fallback ran `DELETE ... WHERE id=0`, so a deployment without the legacy table
+    reported a clean `deleted: 0` and the admin UI toasted "Rollback complete" while
+    nothing was removed. The second handler (`rollback_batch_v2`) covered all the
+    tables but was dead code, and it also DELETEd the `import_batches` row, which
+    would have broken the 'rolled_back' status badge in templates/admin.html.
+
+    So: one handler, all the tables, the batch row *kept* and marked rolled_back, one
+    transaction, and no blanket `except: pass` -- only "table/column absent in this
+    deployment" is skipped; any other DB error rolls back and 500s instead of hiding.
+
+    Response shape is load-bearing: `rollbackBatch()` in templates/admin.html reads
+    `d.deleted` (plain integer total) and `d.error`. `by_table` is additive.
+    """
+    conn = get_db(); cursor = conn.cursor(); by_table = {}; deleted = 0
+    try:
+        for table in _IMPORT_ROLLBACK_TABLES:
+            count = _rollback_delete(cursor, table, batch_id)
+            if count is None: continue
+            by_table[table] = count; deleted += count
+        try: cursor.execute("UPDATE import_batches SET status='rolled_back', rolled_back_at=NOW() WHERE id=%s", (batch_id,))
+        except mysql.connector.Error as exc:
+            if getattr(exc, "errno", None) not in (_ER_NO_SUCH_TABLE, _ER_BAD_FIELD_ERROR): raise
+        conn.commit()
+    except mysql.connector.Error as exc:
+        conn.rollback(); conn.close(); return jsonify({"error": f"Rollback failed: {exc}"}), 500
+    conn.close(); log_audit("data_import_rollback", f"Rolled back import batch {batch_id}", None, {"deleted": deleted, "by_table": by_table})
+    return jsonify({"success": True, "deleted": deleted, "by_table": by_table})
 
 
 @app.route("/api/universal-search", methods=["POST"])
@@ -3377,7 +3443,10 @@ def validate_import_rows(module, rows, mapping=None):
         raw=_normalize_row(orig); row={}
         if mapping:
             for dest,src in mapping.items(): row[dest]=raw.get(_norm_header(src),'')
-        else: row=raw
+        # A copy, not the mapping itself: `row['_raw']=raw` on the same object
+        # would make it self-referential, and every importer below serialises
+        # `row['_raw']` with json.dumps -> ValueError: Circular reference detected.
+        else: row=dict(raw)
         row['_raw']=raw
         for req in cfg.get('required',[]):
             if not row.get(req): issues.append({'row':i,'type':'missing_required','field':req,'message':f'Missing mandatory field: {req}'})
@@ -3653,15 +3722,6 @@ def import_report_v2(batch_id):
 @admin_required
 def import_report_pdf_v2(batch_id):
     data=analysis_workspace_v2(batch_id).get_json(); return Response(json.dumps(data,indent=2),mimetype='application/json',headers={'Content-Disposition':f'attachment; filename=sentinel_report_{batch_id}.json'})
-
-@app.route('/api/admin/data/rollback/<int:batch_id>', methods=['POST'])
-@admin_required
-def rollback_batch_v2(batch_id):
-    conn=get_db(); cur=conn.cursor(); deleted=0
-    for table,col in [('cdr_records','import_batch_id'),('ipdr_records','import_batch_id'),('subscriber_records','import_batch_id'),('vehicle_records','import_batch_id'),('bts_tower_records','import_batch_id'),('master_data_records','import_batch_id'),('import_batches','id')]:
-        try: cur.execute(f'DELETE FROM {table} WHERE {col}=%s',(batch_id,)); deleted+=cur.rowcount
-        except Exception: pass
-    conn.commit(); conn.close(); return jsonify({'success':True,'deleted':deleted})
 
 # ─────────────────────────────────────────────
 # PLANS, CREDITS AND PAYMENTS
@@ -3999,7 +4059,8 @@ def payments_checkout():
     conn.close()
 
     log_activity(user["id"], "payment_order_created",
-                 f"{user.get('name')} ordered {plan['name']} ({plan['credits']} credits, ₹{plan['price_inr']}) via {provider.name}")
+                 f"{user.get('name')} ordered {plan['name']} ({plan['credits']} credits, ₹{plan['price_inr']}) via {provider.name}",
+                 actor_type="user")
     return jsonify({
         "success": True,
         "order_ref": order_ref,
@@ -4062,7 +4123,8 @@ def payments_webhook(provider_name):
     conn.close()
     if granted:
         log_activity(order["user_id"], "payment_captured",
-                     f"{order['order_ref']} paid via {provider.name} — {order['credits']} credits granted")
+                     f"{order['order_ref']} paid via {provider.name} — {order['credits']} credits granted",
+                     actor_type="user")
     return jsonify({"success": True, "credited": granted})
 
 
