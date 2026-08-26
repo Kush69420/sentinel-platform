@@ -678,11 +678,25 @@ def _json_clean(row):
         out[k]=v.isoformat() if hasattr(v,"isoformat") else v
     return out
 
-def log_activity(admin_id, action: str, description: str):
-    # The caller never passes an IP: it is taken from the live request here so that
-    # every logged action fills activity_log.ip_address, not just the handful that
-    # happen to interpolate it into the free-text description. Outside a request
-    # (startup, background work) there is no peer address and the column stays NULL.
+def log_activity(actor_id, action: str, description: str, actor_type: str = "admin"):
+    """Write one row to activity_log on behalf of whoever performed the action.
+
+    The actor is deliberately split into `actor_type` + `actor_id` rather than
+    being a single id, because activity_log.admin_id carries a foreign key to
+    admin_users(id) (db_setup.sql). A bot_users id passed into that column is
+    rejected by MySQL with error 1452 (foreign key constraint fails), and since
+    the insert below is wrapped in try/except the row is then dropped in
+    silence — which is exactly how the platform ended up with no user-side audit
+    trail at all. Only an admin identity may reach admin_id; every other actor
+    is recorded through actor_type/actor_id, which have no FK (both added by
+    migration_admin_customization.sql, same pair log_audit() already writes).
+
+    The caller never passes an IP: it is taken from the live request here so that
+    every logged action fills activity_log.ip_address, not just the handful that
+    happen to interpolate it into the free-text description. Outside a request
+    (startup, background work) there is no peer address and the column stays NULL.
+    """
+    admin_id = actor_id if actor_type == "admin" else None
     ip = _client_ip() if has_request_context() else None
     try:
         conn = get_db()
@@ -690,14 +704,19 @@ def log_activity(admin_id, action: str, description: str):
         try:
             cursor.execute(
                 """
-                INSERT INTO activity_log (admin_id, action, description, ip_address, created_at)
-                VALUES (%s,%s,%s,%s,NOW())
+                INSERT INTO activity_log (admin_id, action, description, ip_address, actor_type, actor_id, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,NOW())
                 """,
-                (admin_id, action, description, ip or None),
+                (admin_id, action, description, ip or None, actor_type, actor_id),
             )
         except mysql.connector.Error:
-            # ip_address arrives via migration_admin_customization.sql; fall back for
-            # schemas that predate it rather than losing the log line entirely.
+            # ip_address/actor_type/actor_id arrive via migration_admin_customization.sql;
+            # fall back for schemas that predate them rather than losing the log line
+            # entirely. Note this passes the *computed* admin_id (None for non-admin
+            # actors), never the raw actor_id: "recovering" by putting a bot_users id
+            # back into the FK column would just re-create the 1452 this function exists
+            # to avoid, and lose the row anyway. On a legacy schema a user action is
+            # therefore recorded without its actor id, which beats not recording it.
             cursor.execute(
                 """
                 INSERT INTO activity_log (admin_id, action, description, created_at)
@@ -1013,7 +1032,7 @@ def lea_register():
     conn.close()
 
     application_id = f"LEA-{datetime.now().year}-{new_id:04d}"
-    log_activity(account["id"], "lea_verification_submitted", f"{account.get('name')} submitted {application_id}")
+    log_activity(account["id"], "lea_verification_submitted", f"{account.get('name')} submitted {application_id}", actor_type="user")
     return jsonify({"success": True, "application_id": application_id, "verification_status": "pending"}), 200
 
 
@@ -1089,7 +1108,7 @@ def user_signup():
         return jsonify({"error": "An account already exists for that phone or email. Try signing in."}), 409
     conn.close()
 
-    log_activity(user_id, "user_signup", f"{name} <{email}> signed up from {ip}")
+    log_activity(user_id, "user_signup", f"{name} <{email}> signed up from {ip}", actor_type="user")
 
     session.clear()
     session.permanent = True
@@ -1201,14 +1220,14 @@ def user_login():
                 )
                 conn.commit()
                 conn.close()
-                log_activity(user["id"], "user_account_locked", f"User {identifier} locked after {failed_count} failed attempts from {ip}")
+                log_activity(user["id"], "user_account_locked", f"User {identifier} locked after {failed_count} failed attempts from {ip}", actor_type="user")
                 return jsonify({"error": f"Account locked for {lockout_hours} hours after too many failed attempts.", "locked": True}), 423
             cursor.execute("UPDATE bot_users SET failed_login_count=%s WHERE id=%s", (failed_count, user["id"]))
             conn.commit()
         except Exception:
             pass
         conn.close()
-        log_activity(user["id"], "failed_login", f"Failed login for {identifier} from {ip} ({failed_count}/{limit})")
+        log_activity(user["id"], "failed_login", f"Failed login for {identifier} from {ip} ({failed_count}/{limit})", actor_type="user")
         return jsonify({"error": "Invalid credentials"}), 401
 
     if user.get("twofa_enabled"):
@@ -1226,7 +1245,7 @@ def user_login():
                 conn.close()
                 return jsonify({"error": "Invalid 2FA code", "twofa_required": True}), 401
             conn.commit()
-            log_activity(user["id"], "recovery_code_used", f"Recovery code consumed at login from {ip}")
+            log_activity(user["id"], "recovery_code_used", f"Recovery code consumed at login from {ip}", actor_type="user")
 
     # Successful login — reset counter
     try:
@@ -1248,7 +1267,7 @@ def user_login():
     session["user_login_at"] = datetime.utcnow().isoformat()
     session["csrf_token"] = _new_csrf_token()
 
-    log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}")
+    log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}", actor_type="user")
 
     return jsonify({
         "success": True,
@@ -1270,7 +1289,7 @@ def user_login():
 @app.route("/api/user/logout", methods=["POST"])
 @user_required
 def user_logout():
-    log_activity(session.get("user_id"), "user_logout", f"{session.get('user_name', 'User')} logged out from {_client_ip()}")
+    log_activity(session.get("user_id"), "user_logout", f"{session.get('user_name', 'User')} logged out from {_client_ip()}", actor_type="user")
     for key in ["is_user", "user_id", "user_phone", "user_name", "user_department", "user_login_at"]:
         session.pop(key, None)
     return jsonify({"success": True})
@@ -1339,7 +1358,8 @@ def user_password_reset_request():
             row = cursor.fetchone()
             if row:
                 log_activity(row["id"], "password_reset_requested",
-                             f"{row.get('name') or identifier} requested a password reset from {_client_ip()}")
+                             f"{row.get('name') or identifier} requested a password reset from {_client_ip()}",
+                             actor_type="user")
     except Exception:
         pass
     return jsonify(generic)
@@ -1378,7 +1398,7 @@ def user_password_reset_confirm():
     conn.commit()
     conn.close()
 
-    log_activity(user_id, "password_reset_completed", f"Password set via reset code from {_client_ip()}")
+    log_activity(user_id, "password_reset_completed", f"Password set via reset code from {_client_ip()}", actor_type="user")
     return jsonify({"success": True, "message": "Password updated. You can now sign in.", "redirect": "/login"})
 
 
@@ -2177,7 +2197,7 @@ def user_password_change():
     )
     conn.commit()
     conn.close()
-    log_activity(session.get("user_id"), "password_changed", f"Password changed from {_client_ip()}")
+    log_activity(session.get("user_id"), "password_changed", f"Password changed from {_client_ip()}", actor_type="user")
     return jsonify({"success": True})
 
 
@@ -4039,7 +4059,8 @@ def payments_checkout():
     conn.close()
 
     log_activity(user["id"], "payment_order_created",
-                 f"{user.get('name')} ordered {plan['name']} ({plan['credits']} credits, ₹{plan['price_inr']}) via {provider.name}")
+                 f"{user.get('name')} ordered {plan['name']} ({plan['credits']} credits, ₹{plan['price_inr']}) via {provider.name}",
+                 actor_type="user")
     return jsonify({
         "success": True,
         "order_ref": order_ref,
@@ -4102,7 +4123,8 @@ def payments_webhook(provider_name):
     conn.close()
     if granted:
         log_activity(order["user_id"], "payment_captured",
-                     f"{order['order_ref']} paid via {provider.name} — {order['credits']} credits granted")
+                     f"{order['order_ref']} paid via {provider.name} — {order['credits']} credits granted",
+                     actor_type="user")
     return jsonify({"success": True, "credited": granted})
 
 
