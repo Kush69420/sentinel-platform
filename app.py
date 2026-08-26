@@ -2927,17 +2927,63 @@ def admin_data_preview():
     return jsonify({"success": True, "headers": headers, "total_rows": len(rows), "preview": rows[:10]})
 
 
+# MySQL error numbers we treat as "this deployment never created that table/column".
+# `errorcode` is not imported in this module (and `import mysql.connector` alone does
+# not reliably expose `mysql.connector.errorcode`), so the numbers are named here.
+_ER_BAD_FIELD_ERROR = 1054
+_ER_NO_SUCH_TABLE = 1146
+
+# Every table an import batch can write rows into, all keyed on import_batch_id:
+# master_data_records is the legacy generic store (admin_data_upload), the rest are
+# the per-module tables the current wizard (import_execute_v2) writes.
+_IMPORT_ROLLBACK_TABLES = ("cdr_records", "ipdr_records", "subscriber_records", "vehicle_records", "bts_tower_records", "master_data_records")
+
+
+def _rollback_delete(cursor, table, batch_id):
+    """DELETE one batch's rows from `table`; return rows deleted, or None if the table/column doesn't exist here."""
+    try: cursor.execute(f"DELETE FROM {table} WHERE import_batch_id=%s", (batch_id,))
+    except mysql.connector.Error as exc:
+        if getattr(exc, "errno", None) in (_ER_NO_SUCH_TABLE, _ER_BAD_FIELD_ERROR): return None
+        raise
+    return max(cursor.rowcount or 0, 0)
+
+
 @app.route("/api/admin/data/rollback/<int:batch_id>", methods=["POST"])
 @admin_required
 def rollback_import(batch_id):
-    conn = get_db(); cursor = conn.cursor()
-    try: cursor.execute("DELETE FROM master_data_records WHERE import_batch_id=%s", (batch_id,))
-    except mysql.connector.Error: cursor.execute("DELETE FROM master_data_records WHERE id=0")
-    deleted = cursor.rowcount
-    try: cursor.execute("UPDATE import_batches SET status='rolled_back', rolled_back_at=NOW() WHERE id=%s", (batch_id,))
-    except Exception: pass
-    conn.commit(); conn.close(); log_audit("data_import_rollback", f"Rolled back import batch {batch_id}", None, {"deleted": deleted})
-    return jsonify({"success": True, "deleted": deleted})
+    """Undo an import batch: delete its rows everywhere, and mark the batch rolled_back.
+
+    This used to be two view functions bound to the *same* url rule. The one Flask
+    actually dispatched (registered first) deleted only from `master_data_records` --
+    the legacy table -- while the live wizard (`import_execute_v2`) writes to
+    subscriber/vehicle/bts/cdr/ipdr `_records`. Worse, its `except mysql.connector.Error`
+    fallback ran `DELETE ... WHERE id=0`, so a deployment without the legacy table
+    reported a clean `deleted: 0` and the admin UI toasted "Rollback complete" while
+    nothing was removed. The second handler (`rollback_batch_v2`) covered all the
+    tables but was dead code, and it also DELETEd the `import_batches` row, which
+    would have broken the 'rolled_back' status badge in templates/admin.html.
+
+    So: one handler, all the tables, the batch row *kept* and marked rolled_back, one
+    transaction, and no blanket `except: pass` -- only "table/column absent in this
+    deployment" is skipped; any other DB error rolls back and 500s instead of hiding.
+
+    Response shape is load-bearing: `rollbackBatch()` in templates/admin.html reads
+    `d.deleted` (plain integer total) and `d.error`. `by_table` is additive.
+    """
+    conn = get_db(); cursor = conn.cursor(); by_table = {}; deleted = 0
+    try:
+        for table in _IMPORT_ROLLBACK_TABLES:
+            count = _rollback_delete(cursor, table, batch_id)
+            if count is None: continue
+            by_table[table] = count; deleted += count
+        try: cursor.execute("UPDATE import_batches SET status='rolled_back', rolled_back_at=NOW() WHERE id=%s", (batch_id,))
+        except mysql.connector.Error as exc:
+            if getattr(exc, "errno", None) not in (_ER_NO_SUCH_TABLE, _ER_BAD_FIELD_ERROR): raise
+        conn.commit()
+    except mysql.connector.Error as exc:
+        conn.rollback(); conn.close(); return jsonify({"error": f"Rollback failed: {exc}"}), 500
+    conn.close(); log_audit("data_import_rollback", f"Rolled back import batch {batch_id}", None, {"deleted": deleted, "by_table": by_table})
+    return jsonify({"success": True, "deleted": deleted, "by_table": by_table})
 
 
 @app.route("/api/universal-search", methods=["POST"])
@@ -3656,15 +3702,6 @@ def import_report_v2(batch_id):
 @admin_required
 def import_report_pdf_v2(batch_id):
     data=analysis_workspace_v2(batch_id).get_json(); return Response(json.dumps(data,indent=2),mimetype='application/json',headers={'Content-Disposition':f'attachment; filename=sentinel_report_{batch_id}.json'})
-
-@app.route('/api/admin/data/rollback/<int:batch_id>', methods=['POST'])
-@admin_required
-def rollback_batch_v2(batch_id):
-    conn=get_db(); cur=conn.cursor(); deleted=0
-    for table,col in [('cdr_records','import_batch_id'),('ipdr_records','import_batch_id'),('subscriber_records','import_batch_id'),('vehicle_records','import_batch_id'),('bts_tower_records','import_batch_id'),('master_data_records','import_batch_id'),('import_batches','id')]:
-        try: cur.execute(f'DELETE FROM {table} WHERE {col}=%s',(batch_id,)); deleted+=cur.rowcount
-        except Exception: pass
-    conn.commit(); conn.close(); return jsonify({'success':True,'deleted':deleted})
 
 # ─────────────────────────────────────────────
 # PLANS, CREDITS AND PAYMENTS
