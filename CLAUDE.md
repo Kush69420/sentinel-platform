@@ -3,7 +3,7 @@
 ## ⚠️ Pending — must be done before deployment
 
 **No MySQL instance is set up yet.** The Day-1 work (self-serve signup, LEA clearance
-gate, credits/payments — see `DAY1_HANDOVER.md`) is complete in code and was verified
+gate, credits/payments — see `docs/DAY1_HANDOVER.md`) is complete in code and was verified
 against a throwaway MySQL 8 Docker container, but **none of it has been applied to a real
 instance**. Until MySQL exists and these steps are run, the platform will not start
 correctly.
@@ -37,7 +37,7 @@ Do these in order once the database server is provisioned:
    and stored API keys. If it is lost or regenerated, every encrypted value becomes
    permanently unrecoverable.
 
-5. **Read `DAY2_HANDOVER.md` before deploying.** Day 2 (fail-fast secrets, CSRF, session
+5. **Read `docs/DAY2_HANDOVER.md` before deploying.** Day 2 (fail-fast secrets, CSRF, session
    cookie hardening + security headers, admin login rate limit, upload/SSE hardening, PDF
    injection escaping) is complete in code on `day2-security` — see that file for what
    changed and, most importantly, the two things it did **not** do that affect the
@@ -87,7 +87,7 @@ one-off ahead of that pass — it will be redone once OAuth2 lands anyway.
 complete on `day2-security` (fail-fast secrets, CSRF protection, session
 cookie hardening + security headers, `/api/admin/login` rate limit,
 `/uploads` path-traversal guard, `/api/events` auth + bounded connections,
-PDF injection escaping — see `DAY2_HANDOVER.md`). Everything in the Critical/
+PDF injection escaping — see `docs/DAY2_HANDOVER.md`). Everything in the Critical/
 High/Medium/Low lists below that Day 2 touched is marked fixed inline; the
 RBAC-adjacent items (admin seed, `role_required` rollout, CLI-endpoint RBAC
 gap) are unchanged and still deferred per the Decision above. `app.run(debug=
@@ -125,7 +125,7 @@ fixes already shipped — those are done.
 - ~~No CSRF protection anywhere~~ — **FIXED in `day2-security`.** A lightweight
   double-submit token is minted into the session at login and required (via
   a `before_request` hook) in the `X-CSRF-Token` header on every
-  POST/PUT/DELETE once a session is authenticated. See `DAY2_HANDOVER.md`.
+  POST/PUT/DELETE once a session is authenticated. See `docs/DAY2_HANDOVER.md`.
 - **RBAC modeled but never enforced** — `admin_users.role` is
   `ENUM('super_admin','manager','support')` and a `role_required(*roles)`
   decorator exists (`app.py`) but is never applied to any route. Every admin,
@@ -143,7 +143,7 @@ fixes already shipped — those are done.
   packaging scope, not touched by Day 2.
 - ~~Insecure fallback `SECRET_KEY`~~ — **FIXED in `day2-security`.** Outside
   `FLASK_ENV=development`, a missing `SECRET_KEY` (or `ENCRYPTION_KEY`) now
-  raises at startup instead of silently falling back. See `DAY2_HANDOVER.md`.
+  raises at startup instead of silently falling back. See `docs/DAY2_HANDOVER.md`.
 
 ### Medium
 
@@ -154,7 +154,7 @@ fixes already shipped — those are done.
   `after_request` hook sets CSP, `X-Frame-Options: DENY`,
   `X-Content-Type-Options: nosniff`, and HSTS (outside dev, HTTPS only). The
   CSP still allows `'unsafe-inline'` for script-src/style-src — see
-  `DAY2_HANDOVER.md` for why that's a deliberate follow-up, not an oversight.
+  `docs/DAY2_HANDOVER.md` for why that's a deliberate follow-up, not an oversight.
 - ~~Session cookie not hardened~~ — **FIXED in `day2-security`.**
   `SESSION_COOKIE_HTTPONLY=True`, `SESSION_COOKIE_SAMESITE="Lax"` always;
   `SESSION_COOKIE_SECURE` defaults `True`, relaxed only under
@@ -186,7 +186,7 @@ fixes already shipped — those are done.
   yet (Day 5 packaging), so this hasn't bitten anyone in practice, but it
   will the moment the app runs with more than one worker. Fixing it means a
   shared store (Redis, or the database) behind the same `rate_limit()`
-  interface — deliberately out of scope for Day 2 (see `DAY2_HANDOVER.md`);
+  interface — deliberately out of scope for Day 2 (see `docs/DAY2_HANDOVER.md`);
   do not add Redis or any shared store without this being scoped as its own
   piece of work.
 
