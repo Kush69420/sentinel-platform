@@ -79,15 +79,21 @@ class UploadsPathTraversalTest(unittest.TestCase):
         ):
             with self.subTest(traversal=traversal):
                 resp = self.client.get(f"/uploads/{traversal}")
-                self.assertNotEqual(resp.status_code, 200,
-                                    f"traversal segment {traversal!r} reached a 200 response")
-                if resp.status_code == 200:
-                    self.assertNotIn(b"outside the upload folder", resp.data)
+                # Exact code, not merely "not 200": a 500 would satisfy
+                # assertNotEqual(..., 200) too and mask a real regression.
+                # Werkzeug's default <filename> converter excludes "/", so an
+                # encoded or literal traversal segment never even matches the
+                # /uploads/<filename> rule and falls through to Flask's own
+                # 404 (confirmed by running this against the real route).
+                self.assertEqual(resp.status_code, 404,
+                                  f"traversal segment {traversal!r} did not get an exact 404")
+                self.assertNotIn(b"outside the upload folder", resp.data)
 
     def test_absolute_path_segment_is_rejected(self):
         self._login_admin()
         resp = self.client.get("/uploads/%2Fetc%2Fpasswd")
-        self.assertNotEqual(resp.status_code, 200)
+        # Exact code, not merely "not 200" — see comment above.
+        self.assertEqual(resp.status_code, 404)
 
 
 class EventStreamAuthTest(unittest.TestCase):

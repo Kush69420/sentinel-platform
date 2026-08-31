@@ -1,6 +1,28 @@
-"""Regression guards for the self-serve signup / LEA clearance rework.
+"""STATIC-SOURCE REGRESSION TRIPWIRE — NOT FUNCTIONAL COVERAGE.
 
-These lock in the specific defects fixed on day 1:
+REMEDIATION-PLAN.md §2.2: every assertion in this file is a substring/ordering
+match against APP_SOURCE, the raw *text* of app.py (or a template file) — it
+never imports Flask's test_client() and passes with zero runtime dependencies
+installed. That makes it good at one narrow thing (catching a known-bad
+pattern, e.g. a fallback dev password string, from silently reappearing in the
+source) and useless at the thing it was previously *treated* as: proof that
+payments, LEA approval, or IDOR guards actually behave correctly at runtime.
+For example, the webhook checks below only assert that the string
+"verify_webhook(" appears at a lower string INDEX than "credit_payment_order("
+— satisfied even by an empty guard body or by dead code containing those two
+tokens in that order, regardless of what either function actually does.
+
+Real test_client()-based coverage for those three areas now lives in:
+  - tests/test_payments_webhook.py         (webhook signature + idempotent credit)
+  - tests/test_lea_application_approval.py (admin-only approve/reject + DB transitions)
+  - tests/test_password_reset_flow.py      (issue/consume, single-use, TTL, hashed-at-rest)
+
+Keep this file — it still catches a regressed dead-code pattern before those
+tests would even run — but do not add new assertions here to "cover" a
+behavior; add a real test_client() test in one of the files above instead.
+
+Everything below this point is unchanged from before the audit and documents
+the specific defects fixed on day 1:
 
   1. Approved accounts were created with no ``password_hash``, and login treated
      an empty hash as "accept the literal string ``dev123``".

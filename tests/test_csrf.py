@@ -127,7 +127,10 @@ class CsrfEnforcementTests(unittest.TestCase):
         rate limit, etc. — just never with the CSRF error.)
         """
         resp = self.client.post("/api/user/password-reset/request", json={})
-        self.assertNotEqual(resp.status_code, 403)
+        # Exact code, not just "not a CSRF 403": an empty body is missing the
+        # required `identifier` field, which fails business-logic validation
+        # with 400 — a 500 here would satisfy assertNotEqual(..., 403) too.
+        self.assertEqual(resp.status_code, 400)
 
     def test_session_without_a_token_yet_is_not_silently_allowed(self):
         """A pre-existing authenticated session with no csrf_token (e.g. one from
@@ -201,12 +204,16 @@ class CsrfLoginLockoutTests(unittest.TestCase):
     def test_password_reset_confirm_is_exempt_with_a_stale_session(self):
         self._stale_session()
         resp = self.client.post("/api/user/password-reset/confirm", json={})
-        self.assertNotEqual(resp.status_code, 403)
+        # An empty body is missing the required `token`, which 400s before
+        # anything else runs — the exact code, not merely "not 403".
+        self.assertEqual(resp.status_code, 400)
 
     def test_signup_is_exempt_with_a_stale_session(self):
         self._stale_session()
         resp = self.client.post("/api/user/signup", json={})
-        self.assertNotEqual(resp.status_code, 403)
+        # An empty body is missing the required `name`, which 400s before any
+        # DB access — the exact code, not merely "not 403".
+        self.assertEqual(resp.status_code, 400)
 
     def test_admin_login_is_exempt_with_a_stale_session(self):
         with self.client.session_transaction() as sess:
@@ -215,7 +222,9 @@ class CsrfLoginLockoutTests(unittest.TestCase):
         # admin_login hits admin_users, which the bot_users fixture does not carry.
         with mock.patch.object(self.app_module, "get_db", return_value=_ActivityOnlyConn()):
             resp = self.client.post("/api/admin/login", json={"username": "nobody", "password": "x"})
-        self.assertNotEqual(resp.status_code, 403)
+        # _ActivityOnlyCursor's fetchone() always returns None, so admin_login
+        # takes its "unknown username" branch: exact 401, not merely "not 403".
+        self.assertEqual(resp.status_code, 401)
 
 
 class CsrfTokenEndpointTests(unittest.TestCase):
