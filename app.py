@@ -645,21 +645,24 @@ def _client_ip():
 
 def table_has_column(table: str, column: str) -> bool:
     try:
-        conn = get_db(); cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s", (table, column))
-        ok = bool(cursor.fetchone()); conn.close(); return ok
+        with db_conn() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s", (table, column))
+            return bool(cursor.fetchone())
     except Exception:
         return False
 
 
 def log_audit(action: str, description: str, old_value=None, new_value=None, actor_type="admin", actor_id=None):
     try:
-        conn=get_db(); cursor=conn.cursor(); admin_id=session.get("admin_id") if actor_type=="admin" else None
-        if table_has_column("activity_log","old_value"):
-            cursor.execute("INSERT INTO activity_log (admin_id, action, description, old_value, new_value, ip_address, actor_type, actor_id, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())", (admin_id, action, description, json.dumps(old_value, default=str) if old_value is not None else None, json.dumps(new_value, default=str) if new_value is not None else None, _client_ip(), actor_type, actor_id or session.get("admin_id") or session.get("user_id")))
-        else:
-            cursor.execute("INSERT INTO activity_log (admin_id, action, description, created_at) VALUES (%s,%s,%s,NOW())", (admin_id, action, description))
-        conn.commit(); conn.close()
+        with db_conn() as conn:
+            cursor = conn.cursor()
+            admin_id = session.get("admin_id") if actor_type == "admin" else None
+            if table_has_column("activity_log", "old_value"):
+                cursor.execute("INSERT INTO activity_log (admin_id, action, description, old_value, new_value, ip_address, actor_type, actor_id, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())", (admin_id, action, description, json.dumps(old_value, default=str) if old_value is not None else None, json.dumps(new_value, default=str) if new_value is not None else None, _client_ip(), actor_type, actor_id or session.get("admin_id") or session.get("user_id")))
+            else:
+                cursor.execute("INSERT INTO activity_log (admin_id, action, description, created_at) VALUES (%s,%s,%s,NOW())", (admin_id, action, description))
+            conn.commit()
     except Exception as exc:
         print(f"audit log failed: {exc}")
 
@@ -699,33 +702,32 @@ def log_activity(actor_id, action: str, description: str, actor_type: str = "adm
     admin_id = actor_id if actor_type == "admin" else None
     ip = _client_ip() if has_request_context() else None
     try:
-        conn = get_db()
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                """
-                INSERT INTO activity_log (admin_id, action, description, ip_address, actor_type, actor_id, created_at)
-                VALUES (%s,%s,%s,%s,%s,%s,NOW())
-                """,
-                (admin_id, action, description, ip or None, actor_type, actor_id),
-            )
-        except mysql.connector.Error:
-            # ip_address/actor_type/actor_id arrive via migration_admin_customization.sql;
-            # fall back for schemas that predate them rather than losing the log line
-            # entirely. Note this passes the *computed* admin_id (None for non-admin
-            # actors), never the raw actor_id: "recovering" by putting a bot_users id
-            # back into the FK column would just re-create the 1452 this function exists
-            # to avoid, and lose the row anyway. On a legacy schema a user action is
-            # therefore recorded without its actor id, which beats not recording it.
-            cursor.execute(
-                """
-                INSERT INTO activity_log (admin_id, action, description, created_at)
-                VALUES (%s,%s,%s,NOW())
-                """,
-                (admin_id, action, description),
-            )
-        conn.commit()
-        conn.close()
+        with db_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO activity_log (admin_id, action, description, ip_address, actor_type, actor_id, created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,NOW())
+                    """,
+                    (admin_id, action, description, ip or None, actor_type, actor_id),
+                )
+            except mysql.connector.Error:
+                # ip_address/actor_type/actor_id arrive via migration_admin_customization.sql;
+                # fall back for schemas that predate them rather than losing the log line
+                # entirely. Note this passes the *computed* admin_id (None for non-admin
+                # actors), never the raw actor_id: "recovering" by putting a bot_users id
+                # back into the FK column would just re-create the 1452 this function exists
+                # to avoid, and lose the row anyway. On a legacy schema a user action is
+                # therefore recorded without its actor id, which beats not recording it.
+                cursor.execute(
+                    """
+                    INSERT INTO activity_log (admin_id, action, description, created_at)
+                    VALUES (%s,%s,%s,NOW())
+                    """,
+                    (admin_id, action, description),
+                )
+            conn.commit()
     except Exception as exc:
         print(f"activity log failed: {exc}")
 
@@ -1752,28 +1754,53 @@ def list_users():
 def modify_credits(user_id):
     data = request.json or {}
     action = data.get("action")
-    amount = int(data.get("amount", 0))
+    try:
+        amount = int(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "amount must be a number"}), 400
     reason = data.get("reason", "admin_adjustment")
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM bot_users WHERE id=%s", (user_id,))
+    cursor.execute("SELECT id, phone, name, credits FROM bot_users WHERE id=%s", (user_id,))
     user = cursor.fetchone()
     if not user:
         conn.close()
         return jsonify({"error": "User not found"}), 404
+
+    # Atomic UPDATE ... SET credits = credits ± %s, same pattern as
+    # charge_for_lookup / log_service_usage_internal / credit_payment_order —
+    # never a plain "SET credits=<value computed from the pre-read row>",
+    # which is what let a concurrent adjustment or spend get silently
+    # overwritten (lost-update race).
     if action == "add":
-        new_val = user["credits"] + amount
+        cursor.execute("UPDATE bot_users SET credits = credits + %s WHERE id=%s", (amount, user_id))
         txn_type, txn_amt = "credit", amount
     elif action == "deduct":
-        new_val = max(0, user["credits"] - amount)
+        # GREATEST clamps at 0 server-side (same floor as the old max(0, ...)
+        # logic) without ever reading the balance back into Python first.
+        cursor.execute("UPDATE bot_users SET credits = GREATEST(credits - %s, 0) WHERE id=%s", (amount, user_id))
         txn_type, txn_amt = "debit", amount
     elif action == "set":
-        new_val = amount
-        txn_type, txn_amt = ("credit", amount - user["credits"]) if amount >= user["credits"] else ("debit", user["credits"] - amount)
+        # "set" is inherently an absolute target, but we still apply it as a
+        # delta off the last value we observed so it composes atomically with
+        # any concurrent add/deduct instead of clobbering it outright.
+        delta = amount - user["credits"]
+        cursor.execute("UPDATE bot_users SET credits = credits + %s WHERE id=%s", (delta, user_id))
+        txn_type, txn_amt = ("credit", delta) if delta >= 0 else ("debit", -delta)
     else:
         conn.close()
         return jsonify({"error": "Invalid action"}), 400
-    cursor.execute("UPDATE bot_users SET credits=%s WHERE id=%s", (new_val, user_id))
+
+    if cursor.rowcount != 1:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+
+    # New balance for the response/log comes from a fresh SELECT, never from
+    # pre-read value + arithmetic in Python — that pre-read value is exactly
+    # what could already be stale by the time the UPDATE above ran.
+    cursor.execute("SELECT credits FROM bot_users WHERE id=%s", (user_id,))
+    new_val = cursor.fetchone()["credits"]
+
     cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,%s,%s,%s)", (user["phone"], txn_type, abs(txn_amt), f"{reason} (by {session.get('admin_name')})"))
     conn.commit()
     conn.close()
@@ -2125,9 +2152,8 @@ def list_services_public():
 # USER PROFILE / PASSWORD / 2FA
 # ─────────────────────────────────────────────
 @app.route("/api/user/profile", methods=["GET"])
+@user_required
 def user_profile():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -2163,9 +2189,8 @@ def user_credit_history():
 
 
 @app.route("/api/user/password-change", methods=["POST"])
+@user_required
 def user_password_change():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     data = request.json or {}
     current_password = data.get("current_password", "")
     new_password = data.get("new_password", "")
@@ -2202,9 +2227,8 @@ def user_password_change():
 
 
 @app.route("/api/user/2fa/setup", methods=["POST"])
+@user_required
 def user_2fa_setup():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     secret = pyotp.random_base32()
     label = f"SENTINEL:{session.get('user_phone')}"
     uri = pyotp.TOTP(secret).provisioning_uri(name=label, issuer_name="SENTINEL")
@@ -2221,9 +2245,8 @@ def user_2fa_setup():
 
 
 @app.route("/api/user/2fa/enable", methods=["POST"])
+@user_required
 def user_2fa_enable():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     otp = (request.json or {}).get("otp", "").strip()
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -2283,7 +2306,7 @@ def _default_ai_provider():
     name = integ.get("name") or ""
     category = (integ.get("category") or "").lower()
     if "gemini" in name.lower() or category == "gemini":
-        model = (json.loads(integ.get("config_json") or "{}").get("model") if False else None) or "gemini-1.5-flash"
+        model = "gemini-1.5-flash"
     else:
         model = "gpt-4o-mini"
     try:
