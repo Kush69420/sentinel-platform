@@ -79,15 +79,23 @@ class UploadsPathTraversalTest(unittest.TestCase):
         ):
             with self.subTest(traversal=traversal):
                 resp = self.client.get(f"/uploads/{traversal}")
-                self.assertNotEqual(resp.status_code, 200,
-                                    f"traversal segment {traversal!r} reached a 200 response")
-                if resp.status_code == 200:
-                    self.assertNotIn(b"outside the upload folder", resp.data)
+                # Every one of these segments contains a slash once decoded, so
+                # Werkzeug's single-segment <filename> converter never matches
+                # the route at all (generic 404) — and even if it did,
+                # secure_filename() would strip it to a name that isn't on
+                # disk, hitting the route's own explicit 404. Confirmed by
+                # direct execution: all three cases return exactly 404.
+                self.assertEqual(resp.status_code, 404,
+                                  f"traversal segment {traversal!r} did not get a clean 404")
+                self.assertNotIn(b"outside the upload folder", resp.data)
 
     def test_absolute_path_segment_is_rejected(self):
         self._login_admin()
         resp = self.client.get("/uploads/%2Fetc%2Fpasswd")
-        self.assertNotEqual(resp.status_code, 200)
+        # %2F decodes to a literal slash, which the single-segment <filename>
+        # converter can never match — Werkzeug 404s before serve_upload() is
+        # even reached. Confirmed by direct execution.
+        self.assertEqual(resp.status_code, 404)
 
 
 class EventStreamAuthTest(unittest.TestCase):
