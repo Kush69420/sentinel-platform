@@ -103,6 +103,7 @@ const state = {
   mode: "cdr",
   cols: [],          // active column defs (incl. enriched)
   rawHeaders: [],
+  rawRows: [],       // original parsed 2D rows, cached at load time (index space buildColumns' rawIdx matches)
   rows: [],          // array of objects keyed by col.key
   view: [],          // filtered + sorted indices into rows
   hidden: new Set(),
@@ -138,6 +139,7 @@ function buildColumns(headers) {
 
 function ingest(headers, dataRows) {
   state.rawHeaders = headers;
+  state.rawRows = dataRows;
   state.cols = buildColumns(headers);
   state.hidden = new Set();
   state.sort = { key: null, dir: 0 };
@@ -470,7 +472,12 @@ function bind() {
   $("#modePick").addEventListener("click", e => {
     const b = e.target.closest("button"); if (!b) return;
     state.mode = b.dataset.mode; setModeUI();
-    if (state.rawHeaders.length) ingest(state.rawHeaders, state.rows.map(o => state.cols.map(c => c.rawIdx > -1 ? o[c.key] : "")));
+    // Re-ingest from the cached ORIGINAL raw rows/headers, never from the previously
+    // rendered rows — buildColumns() computes rawIdx against state.rawHeaders'
+    // positions, so the row array it indexes into must be in that same index space.
+    // Transforming the already-transformed state.rows would mix two unrelated index
+    // spaces (see Phase 3.2 remediation notes).
+    if (state.rawRows.length) ingest(state.rawHeaders, state.rawRows);
     else toast(`${state.mode.toUpperCase()} mode — load a file`);
   });
   // upload
