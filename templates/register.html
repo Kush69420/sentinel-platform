@@ -3,16 +3,71 @@
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>SENTINEL — Create Account</title>
 <link rel="icon" href="/static/favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/theme.css">
 <style>
-:root{--bg:#050910;--surface:#0a111b;--panel:#0e1a29;--border:#18314f;--cyan:#00d2ff;--green:#37ff97;--red:#ff4f73;--amber:#ffbf38;--text:#e5f4ff;--muted:#7696b6;--mono:Consolas,monospace;--sans:Inter,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;background:radial-gradient(circle at 50% -20%,rgba(0,210,255,.18),transparent 34%),var(--bg);color:var(--text);font-family:var(--sans)}body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,210,255,.015) 3px,rgba(0,210,255,.015) 4px)}.wrap{width:min(560px,100%);position:relative;z-index:1}.brand{text-align:center;font-family:var(--mono);letter-spacing:7px;color:var(--cyan);font-size:25px;text-shadow:0 0 24px rgba(0,210,255,.5)}.sub{text-align:center;font-family:var(--mono);letter-spacing:2px;color:var(--muted);font-size:11px;margin:8px 0 22px}.notice{border:1px solid rgba(255,191,56,.3);background:rgba(255,191,56,.07);color:var(--amber);border-radius:14px;padding:14px;font-size:13px;line-height:1.6;margin-bottom:16px}.card{border:1px solid var(--border);background:rgba(10,17,27,.95);border-radius:18px;padding:24px;box-shadow:0 20px 80px rgba(0,0,0,.45)}.section{font-family:var(--mono);font-size:12px;letter-spacing:2px;color:var(--cyan);border-bottom:1px solid var(--border);padding-bottom:8px;margin:20px 0 14px}.section:first-child{margin-top:0}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:13px}.field label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:6px}.req{color:var(--red)}input{width:100%;background:#070d16;border:1px solid var(--border);border-radius:10px;color:var(--text);padding:11px;outline:none}input:focus{border-color:var(--cyan)}.hint{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5}.check{display:flex;gap:10px;align-items:flex-start;color:var(--muted);font-size:12px;line-height:1.5;margin:14px 0}.check input{width:auto;margin-top:3px}.btn{width:100%;border:1px solid var(--cyan);background:linear-gradient(135deg,#006da7,#06456b);color:white;border-radius:12px;padding:13px;font-family:var(--mono);letter-spacing:2px;cursor:pointer}.btn[disabled]{opacity:.55;cursor:default}.err{display:none;border:1px solid rgba(255,79,115,.35);background:rgba(255,79,115,.08);color:var(--red);border-radius:10px;padding:11px;font-size:13px;margin-bottom:14px}.err.show{display:block}.alt{text-align:center;color:var(--muted);font-size:12px;margin-top:16px}.alt a{color:var(--cyan);text-decoration:none}.steps{display:grid;gap:8px;margin-bottom:18px}.step{display:flex;gap:10px;align-items:flex-start;font-size:12px;color:var(--muted);line-height:1.5}.step b{color:var(--text);font-weight:600}.num{flex:0 0 20px;height:20px;border-radius:50%;border:1px solid var(--border);display:grid;place-items:center;font-family:var(--mono);font-size:10px;color:var(--cyan)}@media(max-width:650px){.row{grid-template-columns:1fr}.card{padding:18px}}
+:root{
+  --bg:#050505;--surface:#0d0d0d;--panel:#1A1A1A;--border:#1A1A1A80;--border2:#2b2b2b;
+  --cyan:#00d2ff;--green:#37ff97;--red:#ff4f73;--amber:#ffbf38;
+  --text:#e5f4ff;--muted:#7696b6;--mono:'JetBrains Mono',Consolas,monospace;--sans:'Inter',system-ui,sans-serif;
+  --brand:#00E5FF;--brand-2:#00b8cc;--glow:#39FF14;
+}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;background:radial-gradient(circle at 50% -20%,rgba(0,229,255,.20),transparent 34%),var(--bg);color:var(--text);font-family:var(--sans)}
+body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,229,255,.015) 3px,rgba(0,229,255,.015) 4px)}
+.wrap{width:min(560px,100%);position:relative;z-index:1}
+.brand{text-align:center;font-family:var(--mono);letter-spacing:7px;color:var(--cyan);font-size:25px;text-shadow:0 0 24px rgba(0,210,255,.5);position:relative;display:block}
+.glitch::before,.glitch::after{content:attr(data-text);position:absolute;left:0;top:0;width:100%;opacity:0;pointer-events:none;letter-spacing:inherit}
+.glitch:hover::before{opacity:.7;color:var(--brand);transform:translate(-2px,-1px);mix-blend-mode:screen;clip-path:inset(0 0 55% 0)}
+.glitch:hover::after{opacity:.7;color:var(--glow);transform:translate(2px,1px);mix-blend-mode:screen;clip-path:inset(45% 0 0 0)}
+.sub{text-align:center;font-family:var(--mono);letter-spacing:2px;color:var(--muted);font-size:11px;margin:8px 0 22px}
+.notice{border:1px solid rgba(255,191,56,.3);background:rgba(255,191,56,.07);color:var(--amber);border-radius:14px;padding:14px;font-size:13px;line-height:1.6;margin-bottom:16px}
+.card{border:1px solid var(--border2);background:rgba(26,26,26,.92);border-radius:18px;box-shadow:0 20px 80px rgba(0,0,0,.45),0 0 50px rgba(0,229,255,.06)}
+.card.term-window{padding:0;overflow:hidden}
+.term-window .term-bar{display:flex;align-items:center;gap:6px;padding:11px 16px;background:linear-gradient(180deg,rgba(26,26,26,.95),rgba(43,43,43,.6));border-bottom:1px solid var(--border2)}
+.term-window .term-dot{width:11px;height:11px;border-radius:50%;display:inline-block}
+.term-window .term-dot.r{background:#ff5f57}
+.term-window .term-dot.y{background:#febc2e}
+.term-window .term-dot.g{background:#28c840}
+.term-window .term-label{margin-left:8px;font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.5px}
+.term-window .term-body{padding:24px;font-family:var(--sans)}
+.section{font-family:var(--mono);font-size:12px;letter-spacing:2px;color:var(--cyan);border-bottom:1px solid var(--border);padding-bottom:8px;margin:20px 0 14px}
+.section:first-child{margin-top:0}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.field{margin-bottom:13px}
+.field label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:6px}
+.req{color:var(--red)}
+input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);padding:11px;outline:none}
+input:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(0,229,255,.18)}
+.hint{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.5}
+.check{display:flex;gap:10px;align-items:flex-start;color:var(--muted);font-size:12px;line-height:1.5;margin:14px 0}
+.check input{width:auto;margin-top:3px}
+.btn{width:100%;border:1px solid var(--brand);background:linear-gradient(135deg,var(--brand),var(--brand-2));color:white;border-radius:12px;padding:13px;font-family:var(--mono);letter-spacing:2px;cursor:pointer}
+.btn:hover{box-shadow:0 0 26px rgba(0,229,255,.3)}
+.btn[disabled]{opacity:.55;cursor:default}
+.err{display:none;border:1px solid rgba(255,79,115,.35);background:rgba(255,79,115,.08);color:var(--red);border-radius:10px;padding:11px;font-size:13px;margin-bottom:14px}
+.err.show{display:block}
+.alt{text-align:center;color:var(--muted);font-size:12px;margin-top:16px}
+.alt a{color:var(--cyan);text-decoration:none}
+.steps{display:grid;gap:8px;margin-bottom:18px}
+.step{display:flex;gap:10px;align-items:flex-start;font-size:12px;color:var(--muted);line-height:1.5}
+.step b{color:var(--text);font-weight:600}
+.num{flex:0 0 20px;height:20px;border-radius:50%;border:1px solid var(--border);display:grid;place-items:center;font-family:var(--mono);font-size:10px;color:var(--cyan)}
+@media(max-width:650px){.row{grid-template-columns:1fr}.term-window .term-body{padding:18px}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="brand">SENTINEL</div>
+  <div class="brand glitch" data-text="SENTINEL">SENTINEL</div>
   <div class="sub">CREATE OPERATOR ACCOUNT</div>
   <div class="notice">⚠️ Restricted platform. Creating an account does <b>not</b> grant access to subscriber data — lookups unlock only after your law-enforcement credentials are verified against your government ID. All access and searches are audited.</div>
-  <div class="card">
+  <div class="card term-window">
+    <div class="term-bar" aria-hidden="true">
+      <span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span>
+      <span class="term-label">officer@sentinel:~/register</span>
+    </div>
+    <div class="term-body">
     <div class="steps">
       <div class="step"><div class="num">1</div><div><b>Create your account</b> — choose your own password.</div></div>
       <div class="step"><div class="num">2</div><div><b>Submit LEA verification</b> from your dashboard: government ID and department ID card.</div></div>
@@ -38,6 +93,7 @@
       <button class="btn" id="submitBtn">▶ CREATE ACCOUNT</button>
     </form>
     <div class="alt">Already registered? <a href="/login">Sign in</a> &nbsp;·&nbsp; <a href="/pricing">View pricing</a></div>
+    </div>
   </div>
 </div>
 <script>

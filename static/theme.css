@@ -1,21 +1,30 @@
 /* ============================================================
-   SENTINEL — Unified Theme Tokens (Slate / Sky / Indigo)
+   SENTINEL — Unified Theme Tokens (probablysecure-web palette)
    Drop-in: <link rel="stylesheet" href="/static/theme.css">
    Apply class .sentinel-theme on <body> (or :root usage below).
+
+   Palette source: ~/Documents/probablysecure-web/tailwind.config.js
+   cyber.dark #050505  cyber.gray #1A1A1A  cyber.blue #00E5FF
+   cyber.green #39FF14
+   Superseded the earlier invented blue-temperature palette — rejected
+   as not a real port and too light/navy. This is the actual source palette.
+   The source also defines cyber.purple (#bc13fe); dropped here per explicit
+   user direction — secondary accents use a tonal blue instead.
    ============================================================ */
 :root{
-  /* Surfaces */
-  --bg:#0F172A;          /* page background        */
-  --surface:#1E293B;     /* panels / toolbars      */
-  --card:#334155;        /* raised cards / inputs  */
-  --card-2:#3b4a61;      /* hover elevation        */
+  /* Surfaces — near-black, matching source's cyber-dark, not navy */
+  --bg:#050505;           /* page background        */
+  --surface:#0d0d0d;      /* panels / toolbars      */
+  --card:#1A1A1A;         /* raised cards / inputs  */
+  --card-2:#242424;       /* hover elevation        */
 
-  /* Brand */
-  --primary:#38BDF8;     /* sky    — primary action/active */
-  --primary-press:#0ea5e9;
-  --secondary:#818CF8;   /* indigo — secondary accents     */
+  /* Brand — real source accents */
+  --primary:#00E5FF;      /* cyber-blue — primary action/active */
+  --primary-press:#00b8cc;
+  --secondary:#00b8cc;    /* tonal blue — secondary accents (purple dropped) */
+  --glow:#39FF14;         /* cyber-green — glow/ring/scanline tint only, never text */
 
-  /* Text */
+  /* Text — DO NOT CHANGE: preserved as-is, not part of this restyle */
   --text:#E2E8F0;
   --muted:#94A3B8;
 
@@ -25,15 +34,15 @@
   --danger:#EF4444;
 
   /* Lines & depth */
-  --border:#33415580;            /* card colour @ 50% */
-  --border-strong:#475569;
-  --ring:rgba(56,189,248,.45);   /* focus ring (primary) */
-  --shadow:0 10px 30px rgba(2,6,23,.55);
-  --shadow-lg:0 24px 60px rgba(2,6,23,.65);
+  --border:#1A1A1A80;            /* card colour @ 50% */
+  --border-strong:#2b2b2b;
+  --ring:rgba(0,229,255,.45);    /* focus ring (primary) */
+  --shadow:0 10px 30px rgba(0,0,0,.6);
+  --shadow-lg:0 24px 60px rgba(0,0,0,.7);
 
   /* Type */
   --sans:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --mono:"SFMono-Regular","JetBrains Mono","Consolas",ui-monospace,monospace;
+  --mono:"JetBrains Mono","SFMono-Regular","Consolas",ui-monospace,monospace;
 
   --radius:14px;
   --radius-sm:10px;
@@ -79,5 +88,52 @@
 *::-webkit-scrollbar{width:11px;height:11px}
 *::-webkit-scrollbar-thumb{background:var(--card);border-radius:8px;border:2px solid transparent;background-clip:content-box}
 *::-webkit-scrollbar-thumb:hover{background:var(--border-strong);background-clip:content-box}
+
+/* Cyberpunk primitives (structural/decorative only — never used for text colour) -- */
+.term-window{background:rgba(11,11,11,.85);border:1px solid var(--border-strong);
+  border-radius:var(--radius);overflow:hidden;backdrop-filter:blur(6px)}
+.term-window .term-bar{display:flex;align-items:center;gap:8px;padding:9px 14px;
+  background:rgba(255,255,255,.03);border-bottom:1px solid var(--border)}
+.term-window .term-dot{width:11px;height:11px;border-radius:50%}
+.term-window .term-dot.r{background:#ff5f57}
+.term-window .term-dot.y{background:#febc2e}
+.term-window .term-dot.g{background:#28c840}
+.term-window .term-label{margin-left:8px;font:12px/1 var(--mono);color:var(--muted)}
+.term-window .term-body{padding:16px;font-family:var(--mono)}
+
+/* Flat sitewide texture — direct port of probablysecure-web's .grid-bg (src/index.css) */
+.grid-bg{background-image:linear-gradient(rgba(0,229,255,.055) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,229,255,.055) 1px,transparent 1px);
+  background-size:44px 44px;
+  -webkit-mask-image:radial-gradient(ellipse 80% 60% at 50% 0%,#000 40%,transparent 100%);
+  mask-image:radial-gradient(ellipse 80% 60% at 50% 0%,#000 40%,transparent 100%)}
+
+/* Perspective floor grid — the "3D grid" accent, layered on top of .grid-bg in hero-type sections */
+.grid-3d{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.grid-3d::before{content:"";position:absolute;left:-60%;right:-60%;bottom:-10%;height:100%;
+  background-image:linear-gradient(rgba(0,229,255,.4) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,229,255,.4) 1px,transparent 1px);
+  background-size:56px 56px;transform:perspective(600px) rotateX(58deg);transform-origin:bottom center;
+  -webkit-mask-image:linear-gradient(to top,#000 0%,#000 55%,transparent 92%);
+  mask-image:linear-gradient(to top,#000 0%,#000 55%,transparent 92%)}
+
+.glitch{position:relative;display:inline-block}
+.glitch::before,.glitch::after{content:attr(data-text);position:absolute;top:0;left:0;
+  width:100%;height:100%;opacity:0;pointer-events:none}
+.glitch:hover::before{color:var(--brand,var(--primary));opacity:.7;transform:translate(2px,0);transition:transform .15s}
+.glitch:hover::after{color:var(--brand-2,var(--secondary));opacity:.7;transform:translate(-2px,0);transition:transform .15s}
+
+.scan-sweep{position:fixed;inset:0;pointer-events:none;z-index:60;overflow:hidden}
+.scan-sweep::after{content:"";position:absolute;left:0;right:0;height:120px;
+  background:linear-gradient(to bottom,transparent,rgba(0,229,255,.05),transparent);
+  animation:scan-sweep-move 8s linear infinite}
+@keyframes scan-sweep-move{0%{transform:translateY(-140px)}100%{transform:translateY(100vh)}}
+
+@keyframes theme-flicker{0%,100%{opacity:1}92%{opacity:1}94%{opacity:.72}96%{opacity:1}}
+.flicker{animation:theme-flicker 4s ease-in-out infinite}
+
+.noise{position:relative}
+.noise::after{content:"";position:absolute;inset:0;pointer-events:none;opacity:.03;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}

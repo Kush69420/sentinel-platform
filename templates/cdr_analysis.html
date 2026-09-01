@@ -6,6 +6,9 @@
 <title>SENTINEL — CDR / IPDR Analysis</title>
 <link rel="icon" href="/static/favicon.ico">
 <link rel="stylesheet" href="/static/theme.css"/>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 /* ===== Page shell ===== */
 *{box-sizing:border-box}
@@ -54,7 +57,7 @@ body{
   background:var(--card);border:1px solid var(--border-strong);color:var(--text);
   border-radius:999px;padding:6px 12px;cursor:pointer;white-space:nowrap}
 .chip:hover{border-color:var(--primary)}
-.chip.active{background:rgba(56,189,248,.14);border-color:var(--primary);color:var(--primary)}
+.chip.active{background:rgba(0,229,255,.14);border-color:var(--primary);color:var(--primary)}
 .chip .x{font-size:14px;line-height:1;opacity:.7}
 .filterbar{display:flex;gap:8px;flex-wrap:wrap;padding:0 16px 10px;background:var(--surface);border-bottom:1px solid var(--border)}
 .filterbar:empty{display:none;padding:0}
@@ -77,8 +80,8 @@ table.sheet thead th{
 .th-inner .menu:hover{opacity:1;background:var(--card)}
 .th-inner.filtered{box-shadow:inset 0 -2px 0 var(--secondary)}
 td .cell{display:block;padding:8px 10px;overflow:hidden;text-overflow:ellipsis;max-width:340px}
-tbody tr:nth-child(even) td{background:#16233b}
-tbody tr:hover td{background:rgba(56,189,248,.08)}
+tbody tr:nth-child(even) td{background:rgba(43,43,43,.22)}
+tbody tr:hover td{background:rgba(0,229,255,.08)}
 /* row number + freeze */
 .rownum{position:sticky;left:0;z-index:5;background:var(--surface)!important;
   color:var(--muted);text-align:right;font:600 11px var(--mono);min-width:54px}
@@ -86,7 +89,7 @@ tbody tr:hover td{background:rgba(56,189,248,.08)}
 thead .rownum{z-index:7}
 td.frozen,th.frozen{position:sticky;z-index:5;background:var(--surface)!important}
 thead th.frozen{z-index:7}
-td.frozen{background:#1a2740!important}
+td.frozen{background:var(--card-2)!important}
 .col-enriched .cell{color:var(--secondary)}
 .hl{background:rgba(245,158,11,.32);border-radius:3px;color:#fff;padding:0 1px}
 
@@ -121,7 +124,7 @@ td.frozen{background:#1a2740!important}
 /* ===== Columns panel ===== */
 .drawer{position:fixed;inset:0;z-index:80;display:none}
 .drawer.show{display:block}
-.drawer .scrim{position:absolute;inset:0;background:rgba(2,6,23,.6)}
+.drawer .scrim{position:absolute;inset:0;background:rgba(0,0,0,.6)}
 .drawer .panel{position:absolute;top:0;right:0;height:100%;width:min(340px,90vw);
   background:var(--surface);border-left:1px solid var(--border-strong);
   box-shadow:var(--shadow-lg);display:flex;flex-direction:column}
@@ -158,7 +161,7 @@ td.frozen{background:#1a2740!important}
   border:1px solid var(--border);display:grid;place-items:center;font-size:30px}
 .dropzone{border:2px dashed var(--border-strong);border-radius:16px;padding:30px 40px;
   cursor:pointer;transition:border-color .15s,background .15s}
-.dropzone:hover,.dropzone.over{border-color:var(--primary);background:rgba(56,189,248,.06)}
+.dropzone:hover,.dropzone.over{border-color:var(--primary);background:rgba(0,229,255,.06)}
 .spinner{width:34px;height:34px;border:3px solid var(--card);border-top-color:var(--primary);
   border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
