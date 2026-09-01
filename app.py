@@ -1150,6 +1150,13 @@ def user_login():
     if not identifier or not password:
         return jsonify({"error": "Phone/email and password are required"}), 400
 
+    # Signup (and the reset-request flow) store phone/email normalised via
+    # normalise_phone()/.lower() — match that here so a phone typed with spaces/
+    # dashes, or an email with different casing, still finds the account instead
+    # of failing with a spurious "Invalid credentials".
+    identifier_phone = normalise_phone(identifier)
+    identifier_email = identifier.lower()
+
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
 
@@ -1166,7 +1173,7 @@ def user_login():
             WHERE phone=%s OR official_email=%s
             LIMIT 1
             """,
-            (identifier, identifier),
+            (identifier_phone, identifier_email),
         )
     except mysql.connector.Error:
         cursor.execute(
@@ -1179,7 +1186,7 @@ def user_login():
             WHERE phone=%s
             LIMIT 1
             """,
-            (identifier,),
+            (identifier_phone,),
         )
 
     user = cursor.fetchone()

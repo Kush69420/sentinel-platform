@@ -26,8 +26,8 @@ class FakeCursor:
         self.rowcount = 0
 
         if q.startswith("SELECT id, phone, name, department, official_email, password_hash"):
-            identifier = params[0]
-            u = next((u for u in self.db["bot_users"].values() if u["phone"] == identifier or u.get("official_email") == identifier), None)
+            phone_param, email_param = params
+            u = next((u for u in self.db["bot_users"].values() if u["phone"] == phone_param or u.get("official_email") == email_param), None)
             self._result = [dict(u)] if u else []
 
         elif q.startswith("SELECT id, phone, name, department, official_email, credits, status,"):
@@ -138,6 +138,19 @@ class UserAuthTests(unittest.TestCase):
         session_resp = self.client.get("/api/user/session")
         self.assertEqual(session_resp.status_code, 200)
         self.assertTrue(session_resp.get_json()["logged_in"])
+
+    def test_phone_with_formatting_and_mixed_case_email_still_log_in(self):
+        """Signup/reset store phone/email normalised (normalise_phone()/.lower());
+        login must match on the same normalised form or a correctly-formatted
+        password gets rejected just because the identifier had spaces/dashes or
+        different casing than what's stored."""
+        resp = self.client.post("/api/user/login", json={"identifier": "999-999 9999", "password": "CorrectHorse123!"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["success"])
+
+        resp = self.client.post("/api/user/login", json={"identifier": "Ramesh@Example.gov.in", "password": "CorrectHorse123!"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["success"])
 
     def test_wrong_password_is_rejected_and_does_not_leak_which_field_was_wrong(self):
         resp = self.client.post("/api/user/login", json={"identifier": "9999999999", "password": "wrong"})
