@@ -17,6 +17,7 @@ Do these in order once the database server is provisioned:
    mysql -u sentinel_user1 -p sentinel_db < migration_admin_customization.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_fix_import_errors.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_selfserve_auth.sql
+   mysql -u sentinel_user1 -p sentinel_db < migration_activity_log_actor.sql
    ```
    There is no migration runner and no version tracking — nothing records what a given
    database has had applied. Adding a `schema_migrations` table is a Day-4 item.
@@ -52,6 +53,37 @@ Do these in order once the database server is provisioned:
    restart behavior only remains for local dev. Set `FLASK_ENV=production` (or leave it
    unset — an unset value is treated as production-like) plus real `SECRET_KEY` and
    `ENCRYPTION_KEY` values before the app will boot at all.
+
+## ⚠️ Open — `migration_activity_log_actor.sql` is NOT applied to the live DB (2026-08-26)
+
+The code that depends on it is already deployed (merged to `main` as `5ac30d8`); the
+migration is **not**. Nothing breaks in the meantime, so this is a to-do, not an
+incident — but it is invisible until someone tries to query per-user activity.
+
+```bash
+mysql -u sentinel_user1 -p sentinel_db < migration_activity_log_actor.sql
+```
+
+Background: `activity_log.admin_id` FKs `admin_users(id)`, and twelve call sites passed
+a `bot_users.id` into it. MySQL rejected each with error 1452 and `log_activity()`
+swallowed the failure, so the platform had **no user-side audit trail at all** — not a
+partial one, an empty one. The fix routes non-admin actors through the FK-free
+`actor_type`/`actor_id` columns, which **already exist** (added by
+`migration_admin_customization.sql`), which is why the deployed code works without this
+file having been run.
+
+What the migration actually adds is `idx_actor (actor_type, actor_id)`. Without it,
+"show me everything user N did" is a full table scan of `activity_log` — the one query
+the fix exists to enable. It also re-asserts the actor columns idempotently, so it is
+safe on a database that already has them, and it is safe to run at any time. No
+backfill is attempted, deliberately: the rejected rows were never written, so there is
+no historical user activity to repair.
+
+Also still open from the same pass: **past rollbacks were never real.** Until `5ac30d8`
+the admin UI's Rollback button reported success while deleting nothing from the tables
+the live importer actually writes, so any `import_batches` row marked `rolled_back` may
+still have its rows present. Future rollbacks are fixed; the old ones were never
+cleaned up and nothing in the app will tell you which.
 
 Still open and *not* covered by the above: `admin`/`admin123` seed + `role_required`
 rollout (intentionally deferred together, see the Decision note below — now tied to a
