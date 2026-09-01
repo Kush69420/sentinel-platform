@@ -2818,11 +2818,30 @@ def mobile_lookup_report_pdf(search_log_id):
     query_value = log.get("query_value") or ""
     cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query_value,))
     record = cursor.fetchone()
-    # subscriber_records is the single source of truth for mobile_lookup. The old
-    # master_data_records fallback is gone: `data_json LIKE '%query%'` on an unindexed
-    # JSON blob is an unindexable full table scan, and the OR beside it also stopped
-    # record_key's index from being used — a per-report scan of the whole table once
-    # real volume lands. It was invisible only because the table is empty today.
+    if not record:
+        # Exact key only — same reasoning as the run_tool_generic() charging path
+        # (see the comment there): a substring match here could print a PDF report,
+        # tied to a real case reference, carrying an unrelated subscriber's data.
+        #
+        # The old form of this fallback was also a performance trap: `data_json
+        # LIKE '%query%'` on an unindexed JSON blob is a full table scan, and the
+        # OR beside it stopped record_key's index being used at all. Matching on
+        # record_key alone fixes both — the lookup is a single indexed probe.
+        #
+        # The fallback is kept rather than dropped because run_tool_generic()
+        # still charges for a master_data_records hit. Serving the search from
+        # that table but 404-ing its PDF would bill for a report the caller
+        # cannot then obtain.
+        cursor.execute(
+            "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND record_key=%s ORDER BY created_at DESC LIMIT 1",
+            (query_value,),
+        )
+        fallback = cursor.fetchone()
+        if fallback:
+            try:
+                record = json.loads(fallback.get("data_json") or "{}")
+            except Exception:
+                record = {}
     conn.close()
     if not record:
         return jsonify({"error": "Underlying subscriber record no longer exists."}), 404
