@@ -123,21 +123,108 @@ class CsrfEnforcementTests(unittest.TestCase):
     def test_unauthenticated_post_is_not_csrf_blocked(self):
         """No session yet means nothing to forge — CSRF does not apply here.
 
-        (It may still fail for ordinary business-logic reasons — missing body,
-        rate limit, etc. — just never with the CSRF error.)
+        An empty body fails ordinary business-logic validation (missing
+        "identifier") before anything CSRF-related runs, so the exact code
+        is the route's own 400 — never the CSRF 403.
         """
         resp = self.client.post("/api/user/password-reset/request", json={})
-        self.assertNotEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 400)
 
-    def test_session_without_a_token_yet_is_rejected_not_silently_allowed(self):
+    def test_session_without_a_token_yet_is_not_silently_allowed(self):
         """A pre-existing authenticated session with no csrf_token (e.g. one from
-        before this feature shipped) must fail closed, not be waved through."""
+        before this feature shipped) must fail closed, not be waved through.
+
+        It used to fail closed with a 403 that no amount of retrying could clear.
+        It now fails closed by dropping the unusable session: the request runs
+        as an anonymous caller, so @user_required answers 401 and the frontend
+        can send the user to a login that actually works.
+        """
         with self.client.session_transaction() as sess:
             sess["is_user"] = True
             sess["user_id"] = 1
             # deliberately no csrf_token
         resp = self.client.post("/api/user/logout", headers={"X-CSRF-Token": "anything"})
-        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 401)
+        with self.client.session_transaction() as sess:
+            self.assertNotIn("is_user", sess, "the unusable session was left in place")
+
+
+class CsrfLoginLockoutTests(unittest.TestCase):
+    """Regression: a stale session cookie must never block logging back in.
+
+    A browser holding a session cookie minted before CSRF enforcement shipped
+    (is_user set, no csrf_token) got `CSRF token missing or invalid` from
+    POST /api/user/login itself — the one request that would have handed it a
+    fresh token. The only way out was clearing cookies by hand. The login,
+    signup and password-reset entry points are now exempt from the check.
+    """
+
+    def setUp(self):
+        import app as app_module
+        self.app_module = app_module
+        self.db = make_db()
+        self.get_db_patch = mock.patch.object(app_module, "get_db", return_value=FakeConn(self.db))
+        self.get_db_patch.start()
+        app_module._rate_limiter._windows.clear()
+        app_module.app.config["TESTING"] = True
+        self.client = app_module.app.test_client()
+
+    def tearDown(self):
+        self.get_db_patch.stop()
+
+    def _stale_session(self):
+        with self.client.session_transaction() as sess:
+            sess["is_user"] = True
+            sess["user_id"] = 1
+            # no csrf_token — the shape of every session issued before Day 2
+
+    def test_login_succeeds_with_a_stale_tokenless_session_cookie(self):
+        self._stale_session()
+        resp = self.client.post(
+            "/api/user/login",
+            json={"identifier": "9999999999", "password": "CorrectHorse123!"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertTrue(resp.get_json().get("csrf_token"))
+
+    def test_login_is_exempt_even_with_a_fully_valid_session(self):
+        """Logging in again from an already-authenticated tab must not 403 either."""
+        with self.client.session_transaction() as sess:
+            sess["is_user"] = True
+            sess["user_id"] = 1
+            sess["csrf_token"] = "some-token"
+        resp = self.client.post(
+            "/api/user/login",
+            json={"identifier": "9999999999", "password": "CorrectHorse123!"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+
+    def test_password_reset_confirm_is_exempt_with_a_stale_session(self):
+        """An empty body fails business-logic validation (missing "token")
+        before anything CSRF-related runs, so the exact code is the route's
+        own 400 — never the CSRF 403."""
+        self._stale_session()
+        resp = self.client.post("/api/user/password-reset/confirm", json={})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_signup_is_exempt_with_a_stale_session(self):
+        """An empty body fails business-logic validation (missing "name")
+        before anything CSRF-related runs, so the exact code is the route's
+        own 400 — never the CSRF 403."""
+        self._stale_session()
+        resp = self.client.post("/api/user/signup", json={})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_admin_login_is_exempt_with_a_stale_session(self):
+        """The mocked DB has no matching admin row, so the route's own 401
+        (unknown username) is the exact expected code — never the CSRF 403."""
+        with self.client.session_transaction() as sess:
+            sess["is_admin"] = True
+            sess["admin_id"] = 1
+        # admin_login hits admin_users, which the bot_users fixture does not carry.
+        with mock.patch.object(self.app_module, "get_db", return_value=_ActivityOnlyConn()):
+            resp = self.client.post("/api/admin/login", json={"username": "nobody", "password": "x"})
+        self.assertEqual(resp.status_code, 401)
 
 
 class CsrfTokenEndpointTests(unittest.TestCase):

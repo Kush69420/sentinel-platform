@@ -26,8 +26,8 @@ class FakeCursor:
         self.rowcount = 0
 
         if q.startswith("SELECT id, phone, name, department, official_email, password_hash"):
-            identifier = params[0]
-            u = next((u for u in self.db["bot_users"].values() if u["phone"] == identifier or u.get("official_email") == identifier), None)
+            phone_param, email_param = params
+            u = next((u for u in self.db["bot_users"].values() if u["phone"] == phone_param or u.get("official_email") == email_param), None)
             self._result = [dict(u)] if u else []
 
         elif q.startswith("SELECT id, phone, name, department, official_email, credits, status,"):
@@ -51,6 +51,25 @@ class FakeCursor:
         elif q.startswith("UPDATE bot_users SET failed_login_count=%s WHERE id=%s"):
             failed_count, user_id = params
             self.db["bot_users"][user_id]["failed_login_count"] = failed_count
+
+        elif q.startswith("SELECT 1 FROM admin_users WHERE username=%s AND is_active=1"):
+            # The unified login door probes this first to decide whether the
+            # identifier belongs to an admin (see _is_admin_username).
+            a = next((a for a in self.db.get("admin_users", {}).values()
+                      if a["username"] == params[0] and a.get("is_active", 1)), None)
+            self._result = [{"1": 1}] if a else []
+
+        elif q.startswith("SELECT * FROM admin_users WHERE username=%s AND is_active=1"):
+            a = next((a for a in self.db.get("admin_users", {}).values()
+                      if a["username"] == params[0] and a.get("is_active", 1)), None)
+            self._result = [dict(a)] if a else []
+
+        elif q.startswith("UPDATE admin_users SET failed_login_count=0, locked_until=NULL"):
+            self.db["admin_users"][params[0]]["failed_login_count"] = 0
+            self.db["admin_users"][params[0]]["locked_until"] = None
+
+        elif q.startswith("UPDATE admin_users SET failed_login_count=%s"):
+            self.db["admin_users"][params[-1]]["failed_login_count"] = params[0]
 
         elif q.startswith("SELECT setting_value FROM app_settings"):
             self._result = []
@@ -110,6 +129,15 @@ def make_db():
                 "failed_login_count": 0, "locked_until": None,
             },
         },
+        "admin_users": {
+            1: {
+                "id": 1, "name": "Super Admin", "username": "opsadmin",
+                "password_hash": generate_password_hash("AdminPass123!"),
+                "role": "super_admin", "is_active": 1,
+                "twofa_enabled": 0, "twofa_secret": None, "recovery_codes_hash": None,
+                "failed_login_count": 0, "locked_until": None,
+            },
+        },
     }
 
 
@@ -138,6 +166,19 @@ class UserAuthTests(unittest.TestCase):
         session_resp = self.client.get("/api/user/session")
         self.assertEqual(session_resp.status_code, 200)
         self.assertTrue(session_resp.get_json()["logged_in"])
+
+    def test_phone_with_formatting_and_mixed_case_email_still_log_in(self):
+        """Signup/reset store phone/email normalised (normalise_phone()/.lower());
+        login must match on the same normalised form or a correctly-formatted
+        password gets rejected just because the identifier had spaces/dashes or
+        different casing than what's stored."""
+        resp = self.client.post("/api/user/login", json={"identifier": "999-999 9999", "password": "CorrectHorse123!"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["success"])
+
+        resp = self.client.post("/api/user/login", json={"identifier": "Ramesh@Example.gov.in", "password": "CorrectHorse123!"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["success"])
 
     def test_wrong_password_is_rejected_and_does_not_leak_which_field_was_wrong(self):
         resp = self.client.post("/api/user/login", json={"identifier": "9999999999", "password": "wrong"})
@@ -217,6 +258,66 @@ class UserAuthTests(unittest.TestCase):
         resp = self.client.get("/api/me?phone=9999999999")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["phone"], "8888888888")
+
+
+class UnifiedLoginRoutingTests(unittest.TestCase):
+    """The single /login door must send admins to the admin panel, users to the dashboard."""
+
+    def setUp(self):
+        import app as app_module
+        self.app_module = app_module
+        self.db = make_db()
+        self.fake_conn = FakeConn(self.db)
+        self.get_db_patch = mock.patch.object(app_module, "get_db", return_value=self.fake_conn)
+        self.get_db_patch.start()
+        app_module._rate_limiter._windows.clear()
+        app_module.app.config["TESTING"] = True
+        self.client = app_module.app.test_client()
+
+    def tearDown(self):
+        self.get_db_patch.stop()
+
+    def test_admin_credentials_at_the_user_door_open_an_admin_session(self):
+        resp = self.client.post("/api/user/login", json={"identifier": "opsadmin", "password": "AdminPass123!"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body["redirect"], "/admin")
+        self.assertEqual(body["role"], "super_admin")
+        with self.client.session_transaction() as sess:
+            self.assertTrue(sess.get("is_admin"))
+            self.assertEqual(sess.get("admin_role"), "super_admin")
+            # An admin session must not carry user privileges as well.
+            self.assertFalse(sess.get("is_user"))
+
+    def test_admin_session_from_the_user_door_reaches_admin_only_endpoints(self):
+        self.client.post("/api/user/login", json={"identifier": "opsadmin", "password": "AdminPass123!"})
+        resp = self.client.get("/api/admin/session-info")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_ordinary_user_login_is_unaffected_and_has_no_admin_redirect(self):
+        resp = self.client.post("/api/user/login", json={"identifier": "9999999999", "password": "CorrectHorse123!"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotEqual(resp.get_json().get("redirect"), "/admin")
+        with self.client.session_transaction() as sess:
+            self.assertTrue(sess.get("is_user"))
+            self.assertFalse(sess.get("is_admin"))
+
+    def test_wrong_admin_password_is_rejected_without_falling_through_to_user_lookup(self):
+        resp = self.client.post("/api/user/login", json={"identifier": "opsadmin", "password": "nope"})
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.get_json()["error"], "Invalid credentials")
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get("is_admin"))
+            self.assertFalse(sess.get("is_user"))
+        # The attempt is counted against the admin row, not silently discarded.
+        self.assertEqual(self.db["admin_users"][1]["failed_login_count"], 1)
+
+    def test_deactivated_admin_is_not_routed_to_the_admin_panel(self):
+        self.db["admin_users"][1]["is_active"] = 0
+        resp = self.client.post("/api/user/login", json={"identifier": "opsadmin", "password": "AdminPass123!"})
+        self.assertEqual(resp.status_code, 401)
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get("is_admin"))
 
 
 if __name__ == "__main__":

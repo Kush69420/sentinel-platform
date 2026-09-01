@@ -1,0 +1,4 @@
+# Dev/CI-only dependencies. Not required to run the app — see requirements.txt for that.
+# Installed by .github/workflows/test.yml on top of requirements.txt.
+pytest==9.1.1
+pip-audit==2.10.1

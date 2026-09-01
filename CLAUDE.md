@@ -3,7 +3,7 @@
 ## ⚠️ Pending — must be done before deployment
 
 **No MySQL instance is set up yet.** The Day-1 work (self-serve signup, LEA clearance
-gate, credits/payments — see `DAY1_HANDOVER.md`) is complete in code and was verified
+gate, credits/payments — see `docs/DAY1_HANDOVER.md`) is complete in code and was verified
 against a throwaway MySQL 8 Docker container, but **none of it has been applied to a real
 instance**. Until MySQL exists and these steps are run, the platform will not start
 correctly.
@@ -17,6 +17,7 @@ Do these in order once the database server is provisioned:
    mysql -u sentinel_user1 -p sentinel_db < migration_admin_customization.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_fix_import_errors.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_selfserve_auth.sql
+   mysql -u sentinel_user1 -p sentinel_db < migration_activity_log_actor.sql
    ```
    There is no migration runner and no version tracking — nothing records what a given
    database has had applied. Adding a `schema_migrations` table is a Day-4 item.
@@ -37,7 +38,7 @@ Do these in order once the database server is provisioned:
    and stored API keys. If it is lost or regenerated, every encrypted value becomes
    permanently unrecoverable.
 
-5. **Read `DAY2_HANDOVER.md` before deploying.** Day 2 (fail-fast secrets, CSRF, session
+5. **Read `docs/DAY2_HANDOVER.md` before deploying.** Day 2 (fail-fast secrets, CSRF, session
    cookie hardening + security headers, admin login rate limit, upload/SSE hardening, PDF
    injection escaping) is complete in code on `day2-security` — see that file for what
    changed and, most importantly, the two things it did **not** do that affect the
@@ -52,6 +53,37 @@ Do these in order once the database server is provisioned:
    restart behavior only remains for local dev. Set `FLASK_ENV=production` (or leave it
    unset — an unset value is treated as production-like) plus real `SECRET_KEY` and
    `ENCRYPTION_KEY` values before the app will boot at all.
+
+## ⚠️ Open — `migration_activity_log_actor.sql` is NOT applied to the live DB (2026-08-26)
+
+The code that depends on it is already deployed (merged to `main` as `5ac30d8`); the
+migration is **not**. Nothing breaks in the meantime, so this is a to-do, not an
+incident — but it is invisible until someone tries to query per-user activity.
+
+```bash
+mysql -u sentinel_user1 -p sentinel_db < migration_activity_log_actor.sql
+```
+
+Background: `activity_log.admin_id` FKs `admin_users(id)`, and twelve call sites passed
+a `bot_users.id` into it. MySQL rejected each with error 1452 and `log_activity()`
+swallowed the failure, so the platform had **no user-side audit trail at all** — not a
+partial one, an empty one. The fix routes non-admin actors through the FK-free
+`actor_type`/`actor_id` columns, which **already exist** (added by
+`migration_admin_customization.sql`), which is why the deployed code works without this
+file having been run.
+
+What the migration actually adds is `idx_actor (actor_type, actor_id)`. Without it,
+"show me everything user N did" is a full table scan of `activity_log` — the one query
+the fix exists to enable. It also re-asserts the actor columns idempotently, so it is
+safe on a database that already has them, and it is safe to run at any time. No
+backfill is attempted, deliberately: the rejected rows were never written, so there is
+no historical user activity to repair.
+
+Also still open from the same pass: **past rollbacks were never real.** Until `5ac30d8`
+the admin UI's Rollback button reported success while deleting nothing from the tables
+the live importer actually writes, so any `import_batches` row marked `rolled_back` may
+still have its rows present. Future rollbacks are fixed; the old ones were never
+cleaned up and nothing in the app will tell you which.
 
 Still open and *not* covered by the above: `admin`/`admin123` seed + `role_required`
 rollout (intentionally deferred together, see the Decision note below — now tied to a
@@ -87,7 +119,7 @@ one-off ahead of that pass — it will be redone once OAuth2 lands anyway.
 complete on `day2-security` (fail-fast secrets, CSRF protection, session
 cookie hardening + security headers, `/api/admin/login` rate limit,
 `/uploads` path-traversal guard, `/api/events` auth + bounded connections,
-PDF injection escaping — see `DAY2_HANDOVER.md`). Everything in the Critical/
+PDF injection escaping — see `docs/DAY2_HANDOVER.md`). Everything in the Critical/
 High/Medium/Low lists below that Day 2 touched is marked fixed inline; the
 RBAC-adjacent items (admin seed, `role_required` rollout, CLI-endpoint RBAC
 gap) are unchanged and still deferred per the Decision above. `app.run(debug=
@@ -125,7 +157,7 @@ fixes already shipped — those are done.
 - ~~No CSRF protection anywhere~~ — **FIXED in `day2-security`.** A lightweight
   double-submit token is minted into the session at login and required (via
   a `before_request` hook) in the `X-CSRF-Token` header on every
-  POST/PUT/DELETE once a session is authenticated. See `DAY2_HANDOVER.md`.
+  POST/PUT/DELETE once a session is authenticated. See `docs/DAY2_HANDOVER.md`.
 - **RBAC modeled but never enforced** — `admin_users.role` is
   `ENUM('super_admin','manager','support')` and a `role_required(*roles)`
   decorator exists (`app.py`) but is never applied to any route. Every admin,
@@ -143,7 +175,7 @@ fixes already shipped — those are done.
   packaging scope, not touched by Day 2.
 - ~~Insecure fallback `SECRET_KEY`~~ — **FIXED in `day2-security`.** Outside
   `FLASK_ENV=development`, a missing `SECRET_KEY` (or `ENCRYPTION_KEY`) now
-  raises at startup instead of silently falling back. See `DAY2_HANDOVER.md`.
+  raises at startup instead of silently falling back. See `docs/DAY2_HANDOVER.md`.
 
 ### Medium
 
@@ -154,7 +186,7 @@ fixes already shipped — those are done.
   `after_request` hook sets CSP, `X-Frame-Options: DENY`,
   `X-Content-Type-Options: nosniff`, and HSTS (outside dev, HTTPS only). The
   CSP still allows `'unsafe-inline'` for script-src/style-src — see
-  `DAY2_HANDOVER.md` for why that's a deliberate follow-up, not an oversight.
+  `docs/DAY2_HANDOVER.md` for why that's a deliberate follow-up, not an oversight.
 - ~~Session cookie not hardened~~ — **FIXED in `day2-security`.**
   `SESSION_COOKIE_HTTPONLY=True`, `SESSION_COOKIE_SAMESITE="Lax"` always;
   `SESSION_COOKIE_SECURE` defaults `True`, relaxed only under
@@ -186,7 +218,7 @@ fixes already shipped — those are done.
   yet (Day 5 packaging), so this hasn't bitten anyone in practice, but it
   will the moment the app runs with more than one worker. Fixing it means a
   shared store (Redis, or the database) behind the same `rate_limit()`
-  interface — deliberately out of scope for Day 2 (see `DAY2_HANDOVER.md`);
+  interface — deliberately out of scope for Day 2 (see `docs/DAY2_HANDOVER.md`);
   do not add Redis or any shared store without this being scoped as its own
   piece of work.
 

@@ -1,0 +1,29 @@
+# NATIVE-INSTALL reference unit. The homelab deploy supervises the app with
+# Docker Compose (deploy/docker-compose.yml) instead; this is kept for the
+# eventual move to paid compute.
+[Unit]
+Description=Sentinel Platform (gunicorn)
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel-platform
+EnvironmentFile=/opt/sentinel-platform/.env
+ExecStart=/opt/sentinel-platform/.venv/bin/gunicorn \
+    --worker-class gthread --workers 1 --threads 8 \
+    --timeout 630 --graceful-timeout 30 \
+    --bind 127.0.0.1:8000 \
+    --access-logfile - --error-logfile - \
+    wsgi:app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/sentinel-platform/uploads
+
+[Install]
+WantedBy=multi-user.target

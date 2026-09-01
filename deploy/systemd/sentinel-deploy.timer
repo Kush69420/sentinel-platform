@@ -1,0 +1,14 @@
+[Unit]
+Description=Poll GitHub for SENTINEL changes every 10 minutes
+
+[Timer]
+# 2 min after boot rather than immediately: dockerd and the network auth client both
+# need to settle first, otherwise the first tick just logs a failed fetch.
+OnBootSec=2min
+OnUnitActiveSec=10min
+# Spread ticks slightly so a fetch never lands at the same instant as the backup job.
+RandomizedDelaySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

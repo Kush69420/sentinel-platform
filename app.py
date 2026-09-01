@@ -49,6 +49,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from flask import (
     Flask,
     Response,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
@@ -59,6 +60,14 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
+
+try:
+    import psutil
+except ImportError:
+    # Optional: /api/admin/health reports storage from shutil.disk_usage regardless,
+    # and simply omits cpu_percent/ram_percent when psutil is unavailable. It is in
+    # requirements.txt, so this only bites a partially-installed environment.
+    psutil = None
 
 load_dotenv()
 
@@ -327,6 +336,21 @@ def role_required(*roles):
 # ─────────────────────────────────────────────
 CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
+# Entry points that mint a session (and with it a token) rather than acting on
+# one. Enforcing CSRF here is what locked users out: a browser that still held
+# a session cookie from before this feature shipped — or any session whose
+# token was lost — got a 403 on the very POST that would have issued a fresh
+# token, and the only escape was clearing cookies by hand. There is nothing to
+# protect on these routes anyway: a forged login/signup/password-reset grants
+# the attacker nothing the victim's session had.
+CSRF_EXEMPT_ENDPOINTS = frozenset({
+    "user_login",
+    "user_signup",
+    "admin_login",
+    "user_password_reset_request",
+    "user_password_reset_confirm",
+})
+
 
 def _new_csrf_token() -> str:
     return secrets.token_urlsafe(32)
@@ -336,11 +360,22 @@ def _new_csrf_token() -> str:
 def _enforce_csrf():
     if request.method in CSRF_SAFE_METHODS:
         return None
+    if request.endpoint in CSRF_EXEMPT_ENDPOINTS:
+        return None
     if not (session.get("is_user") or session.get("is_admin")):
         return None  # no authenticated session to forge yet
     expected = session.get("csrf_token")
+    if not expected:
+        # An authenticated session carrying no token cannot ever satisfy this
+        # check, so rejecting it means every state-changing request fails
+        # forever. Drop the unusable session instead and let the request fall
+        # through to the normal auth decorators, which answer 401 and send the
+        # frontend back to a login that works. Still fails closed — the request
+        # proceeds unauthenticated, so it gets no more than an anonymous caller.
+        session.clear()
+        return None
     provided = request.headers.get("X-CSRF-Token", "")
-    if not expected or not provided or not hmac.compare_digest(str(expected), provided):
+    if not provided or not hmac.compare_digest(str(expected), provided):
         return jsonify({"error": "CSRF token missing or invalid. Refresh the page and try again."}), 403
     return None
 
@@ -610,21 +645,24 @@ def _client_ip():
 
 def table_has_column(table: str, column: str) -> bool:
     try:
-        conn = get_db(); cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s", (table, column))
-        ok = bool(cursor.fetchone()); conn.close(); return ok
+        with db_conn() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s", (table, column))
+            return bool(cursor.fetchone())
     except Exception:
         return False
 
 
 def log_audit(action: str, description: str, old_value=None, new_value=None, actor_type="admin", actor_id=None):
     try:
-        conn=get_db(); cursor=conn.cursor(); admin_id=session.get("admin_id") if actor_type=="admin" else None
-        if table_has_column("activity_log","old_value"):
-            cursor.execute("INSERT INTO activity_log (admin_id, action, description, old_value, new_value, ip_address, actor_type, actor_id, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())", (admin_id, action, description, json.dumps(old_value, default=str) if old_value is not None else None, json.dumps(new_value, default=str) if new_value is not None else None, _client_ip(), actor_type, actor_id or session.get("admin_id") or session.get("user_id")))
-        else:
-            cursor.execute("INSERT INTO activity_log (admin_id, action, description, created_at) VALUES (%s,%s,%s,NOW())", (admin_id, action, description))
-        conn.commit(); conn.close()
+        with db_conn() as conn:
+            cursor = conn.cursor()
+            admin_id = session.get("admin_id") if actor_type == "admin" else None
+            if table_has_column("activity_log", "old_value"):
+                cursor.execute("INSERT INTO activity_log (admin_id, action, description, old_value, new_value, ip_address, actor_type, actor_id, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())", (admin_id, action, description, json.dumps(old_value, default=str) if old_value is not None else None, json.dumps(new_value, default=str) if new_value is not None else None, _client_ip(), actor_type, actor_id or session.get("admin_id") or session.get("user_id")))
+            else:
+                cursor.execute("INSERT INTO activity_log (admin_id, action, description, created_at) VALUES (%s,%s,%s,NOW())", (admin_id, action, description))
+            conn.commit()
     except Exception as exc:
         print(f"audit log failed: {exc}")
 
@@ -643,19 +681,53 @@ def _json_clean(row):
         out[k]=v.isoformat() if hasattr(v,"isoformat") else v
     return out
 
-def log_activity(admin_id, action: str, description: str):
+def log_activity(actor_id, action: str, description: str, actor_type: str = "admin"):
+    """Write one row to activity_log on behalf of whoever performed the action.
+
+    The actor is deliberately split into `actor_type` + `actor_id` rather than
+    being a single id, because activity_log.admin_id carries a foreign key to
+    admin_users(id) (db_setup.sql). A bot_users id passed into that column is
+    rejected by MySQL with error 1452 (foreign key constraint fails), and since
+    the insert below is wrapped in try/except the row is then dropped in
+    silence — which is exactly how the platform ended up with no user-side audit
+    trail at all. Only an admin identity may reach admin_id; every other actor
+    is recorded through actor_type/actor_id, which have no FK (both added by
+    migration_admin_customization.sql, same pair log_audit() already writes).
+
+    The caller never passes an IP: it is taken from the live request here so that
+    every logged action fills activity_log.ip_address, not just the handful that
+    happen to interpolate it into the free-text description. Outside a request
+    (startup, background work) there is no peer address and the column stays NULL.
+    """
+    admin_id = actor_id if actor_type == "admin" else None
+    ip = _client_ip() if has_request_context() else None
     try:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO activity_log (admin_id, action, description, created_at)
-            VALUES (%s,%s,%s,NOW())
-            """,
-            (admin_id, action, description),
-        )
-        conn.commit()
-        conn.close()
+        with db_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO activity_log (admin_id, action, description, ip_address, actor_type, actor_id, created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,NOW())
+                    """,
+                    (admin_id, action, description, ip or None, actor_type, actor_id),
+                )
+            except mysql.connector.Error:
+                # ip_address/actor_type/actor_id arrive via migration_admin_customization.sql;
+                # fall back for schemas that predate them rather than losing the log line
+                # entirely. Note this passes the *computed* admin_id (None for non-admin
+                # actors), never the raw actor_id: "recovering" by putting a bot_users id
+                # back into the FK column would just re-create the 1452 this function exists
+                # to avoid, and lose the row anyway. On a legacy schema a user action is
+                # therefore recorded without its actor id, which beats not recording it.
+                cursor.execute(
+                    """
+                    INSERT INTO activity_log (admin_id, action, description, created_at)
+                    VALUES (%s,%s,%s,NOW())
+                    """,
+                    (admin_id, action, description),
+                )
+            conn.commit()
     except Exception as exc:
         print(f"activity log failed: {exc}")
 
@@ -705,6 +777,24 @@ def reset_password_page():
 def cdr_analysis_page():
     """Google Sheets-style CDR / IPDR spreadsheet analysis interface."""
     return render_template("cdr_analysis.html")
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    return Response("User-agent: *\nDisallow: /\n", mimetype="text/plain")
+
+
+# ─────────────────────────────────────────────
+# ERROR HANDLERS
+# ─────────────────────────────────────────────
+@app.errorhandler(404)
+def handle_404(e):
+    return render_template("error.html", code=404, message="Page not found."), 404
+
+
+@app.errorhandler(500)
+def handle_500(e):
+    return render_template("error.html", code=500, message="Something went wrong on our end."), 500
 
 
 # ─────────────────────────────────────────────
@@ -944,7 +1034,7 @@ def lea_register():
     conn.close()
 
     application_id = f"LEA-{datetime.now().year}-{new_id:04d}"
-    log_activity(account["id"], "lea_verification_submitted", f"{account.get('name')} submitted {application_id}")
+    log_activity(account["id"], "lea_verification_submitted", f"{account.get('name')} submitted {application_id}", actor_type="user")
     return jsonify({"success": True, "application_id": application_id, "verification_status": "pending"}), 200
 
 
@@ -1020,7 +1110,7 @@ def user_signup():
         return jsonify({"error": "An account already exists for that phone or email. Try signing in."}), 409
     conn.close()
 
-    log_activity(user_id, "user_signup", f"{name} <{email}> signed up from {ip}")
+    log_activity(user_id, "user_signup", f"{name} <{email}> signed up from {ip}", actor_type="user")
 
     session.clear()
     session.permanent = True
@@ -1049,6 +1139,17 @@ def user_signup():
 
 
 
+def _is_admin_username(identifier):
+    """True when the identifier names an active row in admin_users."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM admin_users WHERE username=%s AND is_active=1 LIMIT 1", (identifier,))
+        return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
 @app.route("/api/user/login", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP
 def user_login():
@@ -1059,6 +1160,32 @@ def user_login():
 
     if not identifier or not password:
         return jsonify({"error": "Phone/email and password are required"}), 400
+
+    # One front door for both sides. /login posts every credential here, so an
+    # identifier naming an active admin is authenticated against admin_users
+    # instead of bot_users and the browser is handed "/admin" to follow rather
+    # than the user dashboard. The two namespaces cannot collide on a real
+    # credential: bot_users is keyed by phone/official_email, admin_users by
+    # username. Falling through to the user lookup on a wrong admin password is
+    # deliberately avoided — it would split one account's lockout counter
+    # across two tables.
+    if _is_admin_username(identifier):
+        payload, status = _perform_admin_login(
+            identifier,
+            password,
+            (data.get("otp") or "").strip(),
+            (data.get("recovery_code") or "").strip(),
+        )
+        if status == 200:
+            payload["redirect"] = "/admin"
+        return jsonify(payload), status
+
+    # Signup (and the reset-request flow) store phone/email normalised via
+    # normalise_phone()/.lower() — match that here so a phone typed with spaces/
+    # dashes, or an email with different casing, still finds the account instead
+    # of failing with a spurious "Invalid credentials".
+    identifier_phone = normalise_phone(identifier)
+    identifier_email = identifier.lower()
 
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -1076,7 +1203,7 @@ def user_login():
             WHERE phone=%s OR official_email=%s
             LIMIT 1
             """,
-            (identifier, identifier),
+            (identifier_phone, identifier_email),
         )
     except mysql.connector.Error:
         cursor.execute(
@@ -1089,7 +1216,7 @@ def user_login():
             WHERE phone=%s
             LIMIT 1
             """,
-            (identifier,),
+            (identifier_phone,),
         )
 
     user = cursor.fetchone()
@@ -1132,14 +1259,14 @@ def user_login():
                 )
                 conn.commit()
                 conn.close()
-                log_activity(user["id"], "user_account_locked", f"User {identifier} locked after {failed_count} failed attempts from {ip}")
+                log_activity(user["id"], "user_account_locked", f"User {identifier} locked after {failed_count} failed attempts from {ip}", actor_type="user")
                 return jsonify({"error": f"Account locked for {lockout_hours} hours after too many failed attempts.", "locked": True}), 423
             cursor.execute("UPDATE bot_users SET failed_login_count=%s WHERE id=%s", (failed_count, user["id"]))
             conn.commit()
         except Exception:
             pass
         conn.close()
-        log_activity(user["id"], "failed_login", f"Failed login for {identifier} from {ip} ({failed_count}/{limit})")
+        log_activity(user["id"], "failed_login", f"Failed login for {identifier} from {ip} ({failed_count}/{limit})", actor_type="user")
         return jsonify({"error": "Invalid credentials"}), 401
 
     if user.get("twofa_enabled"):
@@ -1157,7 +1284,7 @@ def user_login():
                 conn.close()
                 return jsonify({"error": "Invalid 2FA code", "twofa_required": True}), 401
             conn.commit()
-            log_activity(user["id"], "recovery_code_used", f"Recovery code consumed at login from {ip}")
+            log_activity(user["id"], "recovery_code_used", f"Recovery code consumed at login from {ip}", actor_type="user")
 
     # Successful login — reset counter
     try:
@@ -1179,7 +1306,7 @@ def user_login():
     session["user_login_at"] = datetime.utcnow().isoformat()
     session["csrf_token"] = _new_csrf_token()
 
-    log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}")
+    log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}", actor_type="user")
 
     return jsonify({
         "success": True,
@@ -1201,7 +1328,7 @@ def user_login():
 @app.route("/api/user/logout", methods=["POST"])
 @user_required
 def user_logout():
-    log_activity(session.get("user_id"), "user_logout", f"{session.get('user_name', 'User')} logged out from {_client_ip()}")
+    log_activity(session.get("user_id"), "user_logout", f"{session.get('user_name', 'User')} logged out from {_client_ip()}", actor_type="user")
     for key in ["is_user", "user_id", "user_phone", "user_name", "user_department", "user_login_at"]:
         session.pop(key, None)
     return jsonify({"success": True})
@@ -1270,7 +1397,8 @@ def user_password_reset_request():
             row = cursor.fetchone()
             if row:
                 log_activity(row["id"], "password_reset_requested",
-                             f"{row.get('name') or identifier} requested a password reset from {_client_ip()}")
+                             f"{row.get('name') or identifier} requested a password reset from {_client_ip()}",
+                             actor_type="user")
     except Exception:
         pass
     return jsonify(generic)
@@ -1309,22 +1437,20 @@ def user_password_reset_confirm():
     conn.commit()
     conn.close()
 
-    log_activity(user_id, "password_reset_completed", f"Password set via reset code from {_client_ip()}")
+    log_activity(user_id, "password_reset_completed", f"Password set via reset code from {_client_ip()}", actor_type="user")
     return jsonify({"success": True, "message": "Password updated. You can now sign in.", "redirect": "/login"})
 
 
 # ─────────────────────────────────────────────
 # ADMIN AUTH + SECURITY
 # ─────────────────────────────────────────────
-@app.route("/api/admin/login", methods=["POST"])
-@rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP — same shape as user login
-def admin_login():
-    data = request.json or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-    otp = data.get("otp", "").strip()
-    recovery_code = data.get("recovery_code", "").strip()
+def _perform_admin_login(username, password, otp="", recovery_code=""):
+    """Authenticate against admin_users and, on success, establish the admin session.
 
+    Returns an (payload, status) tuple rather than a Response so the same logic
+    can back both the dedicated /api/admin/login endpoint and the unified
+    /api/user/login door, which routes admin credentials here (see user_login).
+    """
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT * FROM admin_users WHERE username=%s AND is_active=1", (username,))
@@ -1337,14 +1463,14 @@ def admin_login():
     if not admin:
         conn.close()
         log_activity(None, "failed_login", f"Failed login attempt for unknown username: {username}")
-        return jsonify(generic_error), 401
+        return generic_error, 401
 
     locked_until = mysql_dt_to_aware(admin.get("locked_until"))
     if locked_until and locked_until > now_utc():
         remaining = int((locked_until - now_utc()).total_seconds())
         conn.close()
         log_activity(admin["id"], "locked_login_attempt", f"Locked account login blocked for {username}")
-        return jsonify({"error": "Account locked", "locked": True, "remaining_seconds": remaining}), 423
+        return {"error": "Account locked", "locked": True, "remaining_seconds": remaining}, 423
 
     if not check_password_hash(admin["password_hash"], password):
         failed_count = int(admin.get("failed_login_count") or 0) + 1
@@ -1356,12 +1482,12 @@ def admin_login():
             conn.commit()
             conn.close()
             log_activity(admin["id"], "account_locked", f"{username} locked after {failed_count} failed login attempts")
-            return jsonify({"error": f"Account locked for {lockout_hours} hours", "locked": True}), 423
+            return {"error": f"Account locked for {lockout_hours} hours", "locked": True}, 423
         cursor.execute("UPDATE admin_users SET failed_login_count=%s WHERE id=%s", (failed_count, admin["id"]))
         conn.commit()
         conn.close()
         log_activity(admin["id"], "failed_login", f"Failed login attempt for {username} ({failed_count}/{limit})")
-        return jsonify(generic_error), 401
+        return generic_error, 401
 
     if admin.get("twofa_enabled"):
         verified = False
@@ -1384,12 +1510,15 @@ def admin_login():
                 verified = False
         if not verified:
             conn.close()
-            return jsonify({"error": "2FA code required", "twofa_required": True}), 401
+            return {"error": "2FA code required", "twofa_required": True}, 401
 
     cursor.execute("UPDATE admin_users SET failed_login_count=0, locked_until=NULL, last_login_at=NOW() WHERE id=%s", (admin["id"],))
     conn.commit()
     conn.close()
 
+    # Regenerate the session on privilege change so a pre-login fixated cookie
+    # cannot be reused as an authenticated admin one (same fix as user_login).
+    session.clear()
     session.permanent = True
     session["is_admin"] = True
     session["admin_id"] = admin["id"]
@@ -1398,13 +1527,26 @@ def admin_login():
     session["login_at"] = datetime.utcnow().isoformat()
     session["csrf_token"] = _new_csrf_token()
     log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()}")
-    return jsonify({
+    return {
         "success": True,
         "name": admin["name"],
         "role": admin["role"],
         "csrf_token": session["csrf_token"],
         "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60")),
-    })
+    }, 200
+
+
+@app.route("/api/admin/login", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP — same shape as user login
+def admin_login():
+    data = request.json or {}
+    payload, status = _perform_admin_login(
+        data.get("username", "").strip(),
+        data.get("password", ""),
+        data.get("otp", "").strip(),
+        data.get("recovery_code", "").strip(),
+    )
+    return jsonify(payload), status
 
 
 @app.route("/api/admin/logout", methods=["POST"])
@@ -1660,28 +1802,53 @@ def list_users():
 def modify_credits(user_id):
     data = request.json or {}
     action = data.get("action")
-    amount = int(data.get("amount", 0))
+    try:
+        amount = int(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "amount must be a number"}), 400
     reason = data.get("reason", "admin_adjustment")
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM bot_users WHERE id=%s", (user_id,))
+    cursor.execute("SELECT id, phone, name, credits FROM bot_users WHERE id=%s", (user_id,))
     user = cursor.fetchone()
     if not user:
         conn.close()
         return jsonify({"error": "User not found"}), 404
+
+    # Atomic UPDATE ... SET credits = credits ± %s, same pattern as
+    # charge_for_lookup / log_service_usage_internal / credit_payment_order —
+    # never a plain "SET credits=<value computed from the pre-read row>",
+    # which is what let a concurrent adjustment or spend get silently
+    # overwritten (lost-update race).
     if action == "add":
-        new_val = user["credits"] + amount
+        cursor.execute("UPDATE bot_users SET credits = credits + %s WHERE id=%s", (amount, user_id))
         txn_type, txn_amt = "credit", amount
     elif action == "deduct":
-        new_val = max(0, user["credits"] - amount)
+        # GREATEST clamps at 0 server-side (same floor as the old max(0, ...)
+        # logic) without ever reading the balance back into Python first.
+        cursor.execute("UPDATE bot_users SET credits = GREATEST(credits - %s, 0) WHERE id=%s", (amount, user_id))
         txn_type, txn_amt = "debit", amount
     elif action == "set":
-        new_val = amount
-        txn_type, txn_amt = ("credit", amount - user["credits"]) if amount >= user["credits"] else ("debit", user["credits"] - amount)
+        # "set" is inherently an absolute target, but we still apply it as a
+        # delta off the last value we observed so it composes atomically with
+        # any concurrent add/deduct instead of clobbering it outright.
+        delta = amount - user["credits"]
+        cursor.execute("UPDATE bot_users SET credits = credits + %s WHERE id=%s", (delta, user_id))
+        txn_type, txn_amt = ("credit", delta) if delta >= 0 else ("debit", -delta)
     else:
         conn.close()
         return jsonify({"error": "Invalid action"}), 400
-    cursor.execute("UPDATE bot_users SET credits=%s WHERE id=%s", (new_val, user_id))
+
+    if cursor.rowcount != 1:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+
+    # New balance for the response/log comes from a fresh SELECT, never from
+    # pre-read value + arithmetic in Python — that pre-read value is exactly
+    # what could already be stale by the time the UPDATE above ran.
+    cursor.execute("SELECT credits FROM bot_users WHERE id=%s", (user_id,))
+    new_val = cursor.fetchone()["credits"]
+
     cursor.execute("INSERT INTO credit_transactions (phone, type, amount, reason) VALUES (%s,%s,%s,%s)", (user["phone"], txn_type, abs(txn_amt), f"{reason} (by {session.get('admin_name')})"))
     conn.commit()
     conn.close()
@@ -2033,9 +2200,8 @@ def list_services_public():
 # USER PROFILE / PASSWORD / 2FA
 # ─────────────────────────────────────────────
 @app.route("/api/user/profile", methods=["GET"])
+@user_required
 def user_profile():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     try:
@@ -2071,9 +2237,8 @@ def user_credit_history():
 
 
 @app.route("/api/user/password-change", methods=["POST"])
+@user_required
 def user_password_change():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     data = request.json or {}
     current_password = data.get("current_password", "")
     new_password = data.get("new_password", "")
@@ -2105,14 +2270,13 @@ def user_password_change():
     )
     conn.commit()
     conn.close()
-    log_activity(session.get("user_id"), "password_changed", f"Password changed from {_client_ip()}")
+    log_activity(session.get("user_id"), "password_changed", f"Password changed from {_client_ip()}", actor_type="user")
     return jsonify({"success": True})
 
 
 @app.route("/api/user/2fa/setup", methods=["POST"])
+@user_required
 def user_2fa_setup():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     secret = pyotp.random_base32()
     label = f"SENTINEL:{session.get('user_phone')}"
     uri = pyotp.TOTP(secret).provisioning_uri(name=label, issuer_name="SENTINEL")
@@ -2129,9 +2293,8 @@ def user_2fa_setup():
 
 
 @app.route("/api/user/2fa/enable", methods=["POST"])
+@user_required
 def user_2fa_enable():
-    if not session.get("is_user"):
-        return jsonify({"error": "Login required"}), 401
     otp = (request.json or {}).get("otp", "").strip()
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -2191,7 +2354,7 @@ def _default_ai_provider():
     name = integ.get("name") or ""
     category = (integ.get("category") or "").lower()
     if "gemini" in name.lower() or category == "gemini":
-        model = (json.loads(integ.get("config_json") or "{}").get("model") if False else None) or "gemini-1.5-flash"
+        model = "gemini-1.5-flash"
     else:
         model = "gpt-4o-mini"
     try:
@@ -2645,7 +2808,10 @@ def mobile_lookup_report_pdf(search_log_id):
     if not log:
         conn.close()
         return jsonify({"error": "Report not found."}), 404
-    if not log.get("credits_used") or (log.get("sources_queried") or "").strip().lower() == "no match":
+    # credits_used is 0 both for a genuine miss and for a match against a
+    # service the admin has marked free — sources_queried is the only field
+    # that actually distinguishes "found nothing" from "found it, for free".
+    if (log.get("sources_queried") or "").strip().lower() == "no match":
         conn.close()
         return jsonify({"error": "No successful search found for this record — nothing to report."}), 400
 
@@ -2656,6 +2822,16 @@ def mobile_lookup_report_pdf(search_log_id):
         # Exact key only — same reasoning as the run_tool_generic() charging path
         # (see the comment there): a substring match here could print a PDF report,
         # tied to a real case reference, carrying an unrelated subscriber's data.
+        #
+        # The old form of this fallback was also a performance trap: `data_json
+        # LIKE '%query%'` on an unindexed JSON blob is a full table scan, and the
+        # OR beside it stopped record_key's index being used at all. Matching on
+        # record_key alone fixes both — the lookup is a single indexed probe.
+        #
+        # The fallback is kept rather than dropped because run_tool_generic()
+        # still charges for a master_data_records hit. Serving the search from
+        # that table but 404-ing its PDF would bill for a report the caller
+        # cannot then obtain.
         cursor.execute(
             "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND record_key=%s ORDER BY created_at DESC LIMIT 1",
             (query_value,),
@@ -2861,17 +3037,63 @@ def admin_data_preview():
     return jsonify({"success": True, "headers": headers, "total_rows": len(rows), "preview": rows[:10]})
 
 
+# MySQL error numbers we treat as "this deployment never created that table/column".
+# `errorcode` is not imported in this module (and `import mysql.connector` alone does
+# not reliably expose `mysql.connector.errorcode`), so the numbers are named here.
+_ER_BAD_FIELD_ERROR = 1054
+_ER_NO_SUCH_TABLE = 1146
+
+# Every table an import batch can write rows into, all keyed on import_batch_id:
+# master_data_records is the legacy generic store (admin_data_upload), the rest are
+# the per-module tables the current wizard (import_execute_v2) writes.
+_IMPORT_ROLLBACK_TABLES = ("cdr_records", "ipdr_records", "subscriber_records", "vehicle_records", "bts_tower_records", "master_data_records")
+
+
+def _rollback_delete(cursor, table, batch_id):
+    """DELETE one batch's rows from `table`; return rows deleted, or None if the table/column doesn't exist here."""
+    try: cursor.execute(f"DELETE FROM {table} WHERE import_batch_id=%s", (batch_id,))
+    except mysql.connector.Error as exc:
+        if getattr(exc, "errno", None) in (_ER_NO_SUCH_TABLE, _ER_BAD_FIELD_ERROR): return None
+        raise
+    return max(cursor.rowcount or 0, 0)
+
+
 @app.route("/api/admin/data/rollback/<int:batch_id>", methods=["POST"])
 @admin_required
 def rollback_import(batch_id):
-    conn = get_db(); cursor = conn.cursor()
-    try: cursor.execute("DELETE FROM master_data_records WHERE import_batch_id=%s", (batch_id,))
-    except mysql.connector.Error: cursor.execute("DELETE FROM master_data_records WHERE id=0")
-    deleted = cursor.rowcount
-    try: cursor.execute("UPDATE import_batches SET status='rolled_back', rolled_back_at=NOW() WHERE id=%s", (batch_id,))
-    except Exception: pass
-    conn.commit(); conn.close(); log_audit("data_import_rollback", f"Rolled back import batch {batch_id}", None, {"deleted": deleted})
-    return jsonify({"success": True, "deleted": deleted})
+    """Undo an import batch: delete its rows everywhere, and mark the batch rolled_back.
+
+    This used to be two view functions bound to the *same* url rule. The one Flask
+    actually dispatched (registered first) deleted only from `master_data_records` --
+    the legacy table -- while the live wizard (`import_execute_v2`) writes to
+    subscriber/vehicle/bts/cdr/ipdr `_records`. Worse, its `except mysql.connector.Error`
+    fallback ran `DELETE ... WHERE id=0`, so a deployment without the legacy table
+    reported a clean `deleted: 0` and the admin UI toasted "Rollback complete" while
+    nothing was removed. The second handler (`rollback_batch_v2`) covered all the
+    tables but was dead code, and it also DELETEd the `import_batches` row, which
+    would have broken the 'rolled_back' status badge in templates/admin.html.
+
+    So: one handler, all the tables, the batch row *kept* and marked rolled_back, one
+    transaction, and no blanket `except: pass` -- only "table/column absent in this
+    deployment" is skipped; any other DB error rolls back and 500s instead of hiding.
+
+    Response shape is load-bearing: `rollbackBatch()` in templates/admin.html reads
+    `d.deleted` (plain integer total) and `d.error`. `by_table` is additive.
+    """
+    conn = get_db(); cursor = conn.cursor(); by_table = {}; deleted = 0
+    try:
+        for table in _IMPORT_ROLLBACK_TABLES:
+            count = _rollback_delete(cursor, table, batch_id)
+            if count is None: continue
+            by_table[table] = count; deleted += count
+        try: cursor.execute("UPDATE import_batches SET status='rolled_back', rolled_back_at=NOW() WHERE id=%s", (batch_id,))
+        except mysql.connector.Error as exc:
+            if getattr(exc, "errno", None) not in (_ER_NO_SUCH_TABLE, _ER_BAD_FIELD_ERROR): raise
+        conn.commit()
+    except mysql.connector.Error as exc:
+        conn.rollback(); conn.close(); return jsonify({"error": f"Rollback failed: {exc}"}), 500
+    conn.close(); log_audit("data_import_rollback", f"Rolled back import batch {batch_id}", None, {"deleted": deleted, "by_table": by_table})
+    return jsonify({"success": True, "deleted": deleted, "by_table": by_table})
 
 
 @app.route("/api/universal-search", methods=["POST"])
@@ -3311,7 +3533,10 @@ def validate_import_rows(module, rows, mapping=None):
         raw=_normalize_row(orig); row={}
         if mapping:
             for dest,src in mapping.items(): row[dest]=raw.get(_norm_header(src),'')
-        else: row=raw
+        # A copy, not the mapping itself: `row['_raw']=raw` on the same object
+        # would make it self-referential, and every importer below serialises
+        # `row['_raw']` with json.dumps -> ValueError: Circular reference detected.
+        else: row=dict(raw)
         row['_raw']=raw
         for req in cfg.get('required',[]):
             if not row.get(req): issues.append({'row':i,'type':'missing_required','field':req,'message':f'Missing mandatory field: {req}'})
@@ -3587,15 +3812,6 @@ def import_report_v2(batch_id):
 @admin_required
 def import_report_pdf_v2(batch_id):
     data=analysis_workspace_v2(batch_id).get_json(); return Response(json.dumps(data,indent=2),mimetype='application/json',headers={'Content-Disposition':f'attachment; filename=sentinel_report_{batch_id}.json'})
-
-@app.route('/api/admin/data/rollback/<int:batch_id>', methods=['POST'])
-@admin_required
-def rollback_batch_v2(batch_id):
-    conn=get_db(); cur=conn.cursor(); deleted=0
-    for table,col in [('cdr_records','import_batch_id'),('ipdr_records','import_batch_id'),('subscriber_records','import_batch_id'),('vehicle_records','import_batch_id'),('bts_tower_records','import_batch_id'),('master_data_records','import_batch_id'),('import_batches','id')]:
-        try: cur.execute(f'DELETE FROM {table} WHERE {col}=%s',(batch_id,)); deleted+=cur.rowcount
-        except Exception: pass
-    conn.commit(); conn.close(); return jsonify({'success':True,'deleted':deleted})
 
 # ─────────────────────────────────────────────
 # PLANS, CREDITS AND PAYMENTS
@@ -3933,7 +4149,8 @@ def payments_checkout():
     conn.close()
 
     log_activity(user["id"], "payment_order_created",
-                 f"{user.get('name')} ordered {plan['name']} ({plan['credits']} credits, ₹{plan['price_inr']}) via {provider.name}")
+                 f"{user.get('name')} ordered {plan['name']} ({plan['credits']} credits, ₹{plan['price_inr']}) via {provider.name}",
+                 actor_type="user")
     return jsonify({
         "success": True,
         "order_ref": order_ref,
@@ -3996,7 +4213,8 @@ def payments_webhook(provider_name):
     conn.close()
     if granted:
         log_activity(order["user_id"], "payment_captured",
-                     f"{order['order_ref']} paid via {provider.name} — {order['credits']} credits granted")
+                     f"{order['order_ref']} paid via {provider.name} — {order['credits']} credits granted",
+                     actor_type="user")
     return jsonify({"success": True, "credited": granted})
 
 

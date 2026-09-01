@@ -1,0 +1,18 @@
+# Build context hygiene — keep secrets, local state and bulk data out of the image.
+.env
+.venv/
+__pycache__/
+*.pyc
+uploads/
+.git/
+.gitignore
+.claude/
+node_modules/
+tests/__pycache__/
+*.bak-*
+app.py.bak-*
+output.pdf
+*.db
+*.sqlite3
+*.xlsx
+deploy/

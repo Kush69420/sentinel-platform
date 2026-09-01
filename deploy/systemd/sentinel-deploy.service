@@ -1,0 +1,16 @@
+[Unit]
+Description=SENTINEL continuous deployment (pull + rebuild on new commits)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# systemd does not set HOME for services. git needs it to find /root/.gitconfig and
+# ~/.ssh/config — the latter is how the deploy key is selected for github.com. Without
+# it every fetch fails on ownership checks or falls back to the wrong SSH identity.
+Environment=HOME=/root
+EnvironmentFile=/etc/sentinel-deploy.conf
+ExecStart=/usr/local/bin/sentinel-deploy.sh
+# A build on spinning rust with 4 cores is slow; do not let systemd kill it midway.
+TimeoutStartSec=1800

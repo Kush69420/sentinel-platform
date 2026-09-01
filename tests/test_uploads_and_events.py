@@ -13,6 +13,7 @@
 """
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,9 +26,25 @@ class UploadsPathTraversalTest(unittest.TestCase):
         app_module.app.config["TESTING"] = True
         self.client = app_module.app.test_client()
 
+        # Everything this test writes goes in a temp tree, not next to app.py.
+        # The container image runs as a non-root uid against a root-owned /app,
+        # so writing into BASE_DIR fails with PermissionError there — correctly.
+        # UPLOAD_FOLDER is read as a module global by the /uploads route, so
+        # repointing it here is enough to redirect the route at the temp tree.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = self._tmp.name
+
+        self._orig_upload_folder = app_module.UPLOAD_FOLDER
+        app_module.UPLOAD_FOLDER = os.path.join(base, "uploads")
+        os.makedirs(app_module.UPLOAD_FOLDER, exist_ok=True)
+        self.addCleanup(
+            setattr, app_module, "UPLOAD_FOLDER", self._orig_upload_folder
+        )
+
         # A "secret" file living outside UPLOAD_FOLDER, sibling to it, that a
         # traversal segment might try to reach.
-        self.secret_path = os.path.join(app_module.BASE_DIR, "day2_traversal_secret.txt")
+        self.secret_path = os.path.join(base, "day2_traversal_secret.txt")
         with open(self.secret_path, "w", encoding="utf-8") as fh:
             fh.write("outside the upload folder")
 
@@ -37,13 +54,6 @@ class UploadsPathTraversalTest(unittest.TestCase):
         self.legit_path = os.path.join(app_module.UPLOAD_FOLDER, self.legit_name)
         with open(self.legit_path, "wb") as fh:
             fh.write(b"\x89PNG\r\n not a real png but bytes are bytes")
-
-    def tearDown(self):
-        for p in (self.secret_path, self.legit_path):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
 
     def _login_admin(self):
         with self.client.session_transaction() as sess:
@@ -69,15 +79,23 @@ class UploadsPathTraversalTest(unittest.TestCase):
         ):
             with self.subTest(traversal=traversal):
                 resp = self.client.get(f"/uploads/{traversal}")
-                self.assertNotEqual(resp.status_code, 200,
-                                    f"traversal segment {traversal!r} reached a 200 response")
-                if resp.status_code == 200:
-                    self.assertNotIn(b"outside the upload folder", resp.data)
+                # Every one of these segments contains a slash once decoded, so
+                # Werkzeug's single-segment <filename> converter never matches
+                # the route at all (generic 404) — and even if it did,
+                # secure_filename() would strip it to a name that isn't on
+                # disk, hitting the route's own explicit 404. Confirmed by
+                # direct execution: all three cases return exactly 404.
+                self.assertEqual(resp.status_code, 404,
+                                  f"traversal segment {traversal!r} did not get a clean 404")
+                self.assertNotIn(b"outside the upload folder", resp.data)
 
     def test_absolute_path_segment_is_rejected(self):
         self._login_admin()
         resp = self.client.get("/uploads/%2Fetc%2Fpasswd")
-        self.assertNotEqual(resp.status_code, 200)
+        # %2F decodes to a literal slash, which the single-segment <filename>
+        # converter can never match — Werkzeug 404s before serve_upload() is
+        # even reached. Confirmed by direct execution.
+        self.assertEqual(resp.status_code, 404)
 
 
 class EventStreamAuthTest(unittest.TestCase):
