@@ -1139,6 +1139,17 @@ def user_signup():
 
 
 
+def _is_admin_username(identifier):
+    """True when the identifier names an active row in admin_users."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM admin_users WHERE username=%s AND is_active=1 LIMIT 1", (identifier,))
+        return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
 @app.route("/api/user/login", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP
 def user_login():
@@ -1149,6 +1160,25 @@ def user_login():
 
     if not identifier or not password:
         return jsonify({"error": "Phone/email and password are required"}), 400
+
+    # One front door for both sides. /login posts every credential here, so an
+    # identifier naming an active admin is authenticated against admin_users
+    # instead of bot_users and the browser is handed "/admin" to follow rather
+    # than the user dashboard. The two namespaces cannot collide on a real
+    # credential: bot_users is keyed by phone/official_email, admin_users by
+    # username. Falling through to the user lookup on a wrong admin password is
+    # deliberately avoided — it would split one account's lockout counter
+    # across two tables.
+    if _is_admin_username(identifier):
+        payload, status = _perform_admin_login(
+            identifier,
+            password,
+            (data.get("otp") or "").strip(),
+            (data.get("recovery_code") or "").strip(),
+        )
+        if status == 200:
+            payload["redirect"] = "/admin"
+        return jsonify(payload), status
 
     # Signup (and the reset-request flow) store phone/email normalised via
     # normalise_phone()/.lower() — match that here so a phone typed with spaces/
@@ -1414,15 +1444,13 @@ def user_password_reset_confirm():
 # ─────────────────────────────────────────────
 # ADMIN AUTH + SECURITY
 # ─────────────────────────────────────────────
-@app.route("/api/admin/login", methods=["POST"])
-@rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP — same shape as user login
-def admin_login():
-    data = request.json or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-    otp = data.get("otp", "").strip()
-    recovery_code = data.get("recovery_code", "").strip()
+def _perform_admin_login(username, password, otp="", recovery_code=""):
+    """Authenticate against admin_users and, on success, establish the admin session.
 
+    Returns an (payload, status) tuple rather than a Response so the same logic
+    can back both the dedicated /api/admin/login endpoint and the unified
+    /api/user/login door, which routes admin credentials here (see user_login).
+    """
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT * FROM admin_users WHERE username=%s AND is_active=1", (username,))
@@ -1435,14 +1463,14 @@ def admin_login():
     if not admin:
         conn.close()
         log_activity(None, "failed_login", f"Failed login attempt for unknown username: {username}")
-        return jsonify(generic_error), 401
+        return generic_error, 401
 
     locked_until = mysql_dt_to_aware(admin.get("locked_until"))
     if locked_until and locked_until > now_utc():
         remaining = int((locked_until - now_utc()).total_seconds())
         conn.close()
         log_activity(admin["id"], "locked_login_attempt", f"Locked account login blocked for {username}")
-        return jsonify({"error": "Account locked", "locked": True, "remaining_seconds": remaining}), 423
+        return {"error": "Account locked", "locked": True, "remaining_seconds": remaining}, 423
 
     if not check_password_hash(admin["password_hash"], password):
         failed_count = int(admin.get("failed_login_count") or 0) + 1
@@ -1454,12 +1482,12 @@ def admin_login():
             conn.commit()
             conn.close()
             log_activity(admin["id"], "account_locked", f"{username} locked after {failed_count} failed login attempts")
-            return jsonify({"error": f"Account locked for {lockout_hours} hours", "locked": True}), 423
+            return {"error": f"Account locked for {lockout_hours} hours", "locked": True}, 423
         cursor.execute("UPDATE admin_users SET failed_login_count=%s WHERE id=%s", (failed_count, admin["id"]))
         conn.commit()
         conn.close()
         log_activity(admin["id"], "failed_login", f"Failed login attempt for {username} ({failed_count}/{limit})")
-        return jsonify(generic_error), 401
+        return generic_error, 401
 
     if admin.get("twofa_enabled"):
         verified = False
@@ -1482,7 +1510,7 @@ def admin_login():
                 verified = False
         if not verified:
             conn.close()
-            return jsonify({"error": "2FA code required", "twofa_required": True}), 401
+            return {"error": "2FA code required", "twofa_required": True}, 401
 
     cursor.execute("UPDATE admin_users SET failed_login_count=0, locked_until=NULL, last_login_at=NOW() WHERE id=%s", (admin["id"],))
     conn.commit()
@@ -1499,13 +1527,26 @@ def admin_login():
     session["login_at"] = datetime.utcnow().isoformat()
     session["csrf_token"] = _new_csrf_token()
     log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()}")
-    return jsonify({
+    return {
         "success": True,
         "name": admin["name"],
         "role": admin["role"],
         "csrf_token": session["csrf_token"],
         "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60")),
-    })
+    }, 200
+
+
+@app.route("/api/admin/login", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP — same shape as user login
+def admin_login():
+    data = request.json or {}
+    payload, status = _perform_admin_login(
+        data.get("username", "").strip(),
+        data.get("password", ""),
+        data.get("otp", "").strip(),
+        data.get("recovery_code", "").strip(),
+    )
+    return jsonify(payload), status
 
 
 @app.route("/api/admin/logout", methods=["POST"])

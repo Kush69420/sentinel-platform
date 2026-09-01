@@ -315,6 +315,11 @@ async function startTimers(){try{const r=await fetch('/api/admin/session-info');
 try{const es=new EventSource('/api/events');es.onmessage=()=>{const active=document.querySelector('.page.active')?.id||''; if(active==='page-api')loadApis(); if(active==='page-services')loadServices(); if(active==='page-dashboard')loadHealth();};}catch(e){}
 
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&loginPage.style.display!=='none')doLogin()});
+
+// Admin credentials entered at the unified /login door already established the
+// session before redirecting here, so probe for it on load and open the console
+// directly. Only a genuinely anonymous visitor is left on the login card.
+(async()=>{const r=await fetch('/api/admin/session-info',{credentials:'same-origin'}).catch(()=>null);if(r&&r.ok){loginPage.style.display='none';shell.style.display='grid';init()}})();
 </script>
 </body>
 </html>

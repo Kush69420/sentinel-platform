@@ -144,7 +144,7 @@ loginForm.addEventListener('submit',async e=>{
   try{
     const res=await fetch('/api/user/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identifier:identifier.value.trim(),password:password.value,otp:otp.value})});
     const data=await res.json();
-    if(res.ok){showSuccess('Login successful. Opening dashboard...'); setTimeout(()=>location.href=data.redirect||'/dashboard',600); return;}
+    if(res.ok){const dest=data.redirect||'/dashboard'; showSuccess('Login successful. Opening '+(dest==='/admin'?'admin console':'dashboard')+'...'); setTimeout(()=>location.href=dest,600); return;}
     if(data.twofa_required){otpWrap.style.display='block'; showError(data.error||'2FA code required'); return;}
     showError(data.error||'Login failed');
   }catch(err){showError('Network error. Is Flask running?')}
