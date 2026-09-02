@@ -19,6 +19,7 @@ Do these in order once the database server is provisioned:
    mysql -u sentinel_user1 -p sentinel_db < migration_selfserve_auth.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_activity_log_actor.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_remove_default_admin.sql
+   mysql -u sentinel_user1 -p sentinel_db < migration_google_admin_oauth.sql
    ```
    There is no migration runner and no version tracking — nothing records what a given
    database has had applied. Adding a `schema_migrations` table is a Day-4 item.
@@ -64,6 +65,69 @@ Do these in order once the database server is provisioned:
    restart behavior only remains for local dev. Set `FLASK_ENV=production` (or leave it
    unset — an unset value is treated as production-like) plus real `SECRET_KEY` and
    `ENCRYPTION_KEY` values before the app will boot at all.
+
+## ⚠️ Google sign-in for the admin console (added 2026-09-02, `phase1-deploy-blockers`)
+
+`/admin` can now offer "Sign in with Google" instead of (or alongside) the
+username/password form. It is off until configured — nothing changes for a
+deployment that does not set the env vars below.
+
+**Env vars** (`.env.example` / `deploy/env.app.example` have the full comments):
+
+- `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI`
+  — all three must be set for Google sign-in to appear at all
+  (`google_oauth_enabled()` in `app.py` requires all three; a partial set is
+  treated as fully off, deliberately — a half-configured flow that redirects
+  to Google and then fails at the callback is worse than never offering the
+  button).
+- `ADMIN_PASSWORD_LOGIN` — break-glass. The moment the three Google vars above
+  are all set, the username/password door on both `/api/admin/login` and the
+  admin branch of `/api/user/login` is switched OFF by default. Set
+  `ADMIN_PASSWORD_LOGIN=1` to force it back on. This exists so a locked-out
+  Google account or a broken Google consent screen cannot lock every admin out
+  of the platform at once — leave it unset/`0` in normal operation, flip it to
+  `1` only to regain access, then set it back.
+
+**Redirect URI**: `GOOGLE_OAUTH_REDIRECT_URI` must be registered in Google
+Cloud Console → APIs & Services → Credentials, character-for-character, or
+Google refuses the callback with `redirect_uri_mismatch`. It must also be a
+stable `https://` host — a rotating quick-tunnel URL (see the homelab NAS
+deployment) cannot work here, since it would need re-registering every time
+the tunnel rotates.
+
+**Critical — the CD pipeline will NOT apply this migration to the live NAS
+database.** `deploy/db-init/00-apply-schema.sh` (which runs
+`migration_google_admin_oauth.sql`, per the schema-order list above) only
+executes when MySQL's `docker-entrypoint-initdb.d` fires — and that only
+happens on an **empty** datadir, i.e. first initialization of a fresh
+container. The live database already has data, so a redeploy will **not** run
+this script and will **not** add `admin_users.google_email`. It must be
+applied by hand, once:
+
+```bash
+mysql -u sentinel_user1 -p sentinel_db < migration_google_admin_oauth.sql
+```
+
+Until that is run, `admin_users.google_email` does not exist, and the Google
+callback's `SELECT ... WHERE LOWER(google_email)=%s` would error. That is
+harmless *only* for as long as `GOOGLE_OAUTH_*` stay unset on that host —
+`google_oauth_enabled()` gates both the login and callback routes closed
+before the query ever runs, so nothing breaks until someone sets the three
+Google env vars without having also run this migration by hand first. Do both
+together.
+
+**Authorized account**: as of this writing the only address authorized to use
+the Google button on the live deployment is `kushagr250@gmail.com`. That
+authorization lives in the database (`admin_users.google_email`), not in
+code — it was granted with:
+
+```bash
+python -m tools.bootstrap_admin --username admin --name "Ops Admin" --google-email kushagr250@gmail.com
+```
+
+Authorizing another address means running `bootstrap_admin.py` again (with
+`--force` if rotating an existing row) — there is no self-registration path,
+by design (see the migration file's header comment for why).
 
 ## ⚠️ Open — `migration_activity_log_actor.sql` is NOT applied to the live DB (2026-08-26)
 
