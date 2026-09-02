@@ -2586,12 +2586,15 @@ def run_tool_generic():
                     })
             except mysql.connector.Error:
                 pass
-            # Neither source matched. The attempt is still recorded — that an officer
-            # searched a number is the compliance record, hit or miss — but nothing is
-            # charged for a miss.
-            charge_for_lookup(cursor, user, service, code, query, case_reference,
-                              found=False, source="No match")
-            conn.commit()
+            # Neither local source matched. Do NOT write the "No match" audit row
+            # here and do NOT return — control must fall through to the API-based
+            # lookup section below (§2), because a Twilio/phone integration may
+            # still turn this into a real hit. Writing (and charging or not
+            # charging) happens once, after we know what that section actually
+            # produced — see the `if code == "mobile_lookup":` block right after
+            # the integration call below. Do not reintroduce an early write/return
+            # here: that previously let a real external hit fall through
+            # uncharged with a false "No match" row (see git history).
 
         if code == "vehicle_lookup":
             cursor.execute("SELECT * FROM vehicle_records WHERE registration_number=%s LIMIT 1", (query,))
@@ -2697,11 +2700,60 @@ def run_tool_generic():
         except Exception as exc:
             errors.append(f"{integ.get('name')} failed: {exc}")
 
+    # mobile_lookup only, closing the loop opened at the "Neither local source
+    # matched" comment above: the only way this tool reaches this point is that
+    # fallthrough (its two DB-hit paths, and every other tool's branch, already
+    # returned earlier). Charge/log exactly once, here, based on what the API
+    # call actually did — the original conn was deliberately closed before the
+    # HTTP call above, so this opens a fresh one rather than holding a DB
+    # connection open across a 45s external request.
+    if code == "mobile_lookup":
+        with db_conn() as log_conn:
+            log_cursor = log_conn.cursor(dictionary=True)
+            if results:
+                # A configured integration returned real data. Bill for it and
+                # record the true source — this is the case that used to slip
+                # through unbilled with a false "No match" row.
+                source = integ["name"] if integ else "External Integration"
+                try:
+                    charged, search_log_id = charge_for_lookup(
+                        log_cursor, user, service, code, query, case_reference,
+                        found=True, source=source)
+                except InsufficientCredits as exc:
+                    log_conn.rollback()
+                    return jsonify({
+                        "error": "Insufficient credits for this lookup.",
+                        "reason": "insufficient_credits",
+                        "credits_required": exc.required,
+                        "credits_available": credits_available,
+                    }), 402
+                log_conn.commit()
+                return jsonify({
+                    "success": True, "tool": code, "query": query,
+                    "credits_charged": charged,
+                    "credits_remaining": credits_available - charged,
+                    # Deliberately no search_log_id: this hit has no
+                    # subscriber_records row (it came from an external API),
+                    # and mobile_lookup_report_pdf reads only
+                    # subscriber_records. Returning an id here would make the
+                    # dashboard offer a "Download PDF" button that 404s —
+                    # omitting it is the fix, not the PDF endpoint itself.
+                    "results": results, "errors": errors,
+                })
+            # Nothing usable came back. A configured integration that failed
+            # (an entry landed in `errors`) is a different fact than "no data
+            # anywhere" (no integration at all, or one that ran clean and
+            # simply found nothing) — keep both uncharged, but keep the audit
+            # trail honest about which one happened.
+            source = "Lookup failed" if errors else "No match"
+            charge_for_lookup(log_cursor, user, service, code, query, case_reference,
+                              found=False, source=source)
+            log_conn.commit()
+        return jsonify({"success": False, "error": "No subscriber record found. Upload Subscriber Database from Admin → Data Upload. Optional: configure Twilio/Numverify API for external phone intelligence.", "errors": errors}), 404
+
     if results:
         return jsonify({"success": True, "tool": code, "query": query, "results": results, "errors": errors})
 
-    if code == "mobile_lookup":
-        return jsonify({"success": False, "error": "No subscriber record found. Upload Subscriber Database from Admin → Data Upload. Optional: configure Twilio/Numverify API for external phone intelligence.", "errors": errors}), 404
     return jsonify({"success": False, "error": f"No working connector/data found for tool '{code}'. Configure API dependency or upload database.", "errors": errors}), 400
 
 

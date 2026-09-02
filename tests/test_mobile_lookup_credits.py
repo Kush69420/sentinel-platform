@@ -74,8 +74,19 @@ class FakeCursor:
             rows = [t for t in self.db["credit_transactions"] if t["phone"] == phone]
             self._result = list(reversed(rows))
 
-        elif q.startswith("SELECT * FROM integrations WHERE is_enabled=1"):
-            self._result = []  # no integrations configured in these tests
+        elif q.startswith("SELECT * FROM integrations WHERE is_enabled=1 AND (name=%s OR category=%s)"):
+            # api_dependency-scoped lookup: match by integration name OR category.
+            name_or_cat = params[0]
+            matches = [i for i in self.db.get("integrations", [])
+                       if i.get("is_enabled") and (i.get("name") == name_or_cat or i.get("category") == name_or_cat)]
+            self._result = [dict(matches[0])] if matches else []
+
+        elif q.startswith("SELECT * FROM integrations WHERE is_enabled=1 AND category=%s"):
+            # category-only lookup (no api_dependency configured on the service).
+            cat = params[0]
+            matches = [i for i in self.db.get("integrations", [])
+                       if i.get("is_enabled") and i.get("category") == cat]
+            self._result = [dict(matches[0])] if matches else []
 
         else:
             raise AssertionError(f"FakeCursor got an unexpected query: {q!r}")
@@ -124,6 +135,7 @@ def make_db():
         },
         "credit_transactions": [],
         "search_logs": [],
+        "integrations": [],  # no integrations configured by default
     }
 
 
@@ -156,6 +168,8 @@ class MobileLookupCreditTests(unittest.TestCase):
             sess["csrf_token"] = self.CSRF_TOKEN
 
     def test_successful_lookup_deducts_credit_and_logs_audit_row(self):
+        # Case (d): a subscriber_records hit (the pre-existing, unmodified path)
+        # still charges exactly once — regression guard for the fallthrough fix.
         self._login(user_id=1, phone="9999999999")
         resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9876543210", "case_reference": "FIR-2026-1182"}, headers=self.CSRF_HEADERS)
         self.assertEqual(resp.status_code, 200)
@@ -181,6 +195,8 @@ class MobileLookupCreditTests(unittest.TestCase):
         self.assertEqual(self.db["search_logs"], [])
 
     def test_no_match_is_logged_but_not_charged(self):
+        # Case (b): local miss + no integration configured at all. Behavior must
+        # be byte-for-byte unchanged from before the fallthrough fix.
         self._login(user_id=1, phone="9999999999")
         resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000"}, headers=self.CSRF_HEADERS)
         self.assertEqual(resp.status_code, 404)
@@ -189,6 +205,68 @@ class MobileLookupCreditTests(unittest.TestCase):
         self.assertEqual(len(self.db["search_logs"]), 1)
         self.assertEqual(self.db["search_logs"][0]["credits_used"], 0)
         self.assertEqual(self.db["search_logs"][0]["sources_queried"], "No match")
+
+    def _add_enabled_twilio_integration(self):
+        # Matches on category ("phone", via TOOL_CATEGORY_MAP["mobile_lookup"])
+        # since the test services row has no api_dependency set.
+        self.db["integrations"].append({
+            "id": 1, "name": "Twilio Lookup Service", "category": "phone",
+            "is_enabled": 1, "base_url": "", "api_key": "test-key", "api_secret": "test-secret",
+        })
+
+    def test_local_miss_with_working_integration_charges_once_with_real_source(self):
+        # Case (a): local miss on both subscriber_records and master_data_records,
+        # but an enabled Twilio integration is configured and returns real data.
+        # This is exactly the fallthrough this bug fix closes: the fake DB used by
+        # the rest of this file hardcodes the integrations query to `[]`, so without
+        # `_add_enabled_twilio_integration()` this path is never exercised and the
+        # bug is invisible to the test suite.
+        self._add_enabled_twilio_integration()
+        self._login(user_id=1, phone="9999999999")
+        fake_twilio_response = {"phone_number": "+910000000000", "carrier": {"name": "Test Telecom"}}
+        with mock.patch.object(self.app_module, "_http_json", return_value=fake_twilio_response) as mocked_http:
+            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000", "case_reference": "FIR-2026-9001"}, headers=self.CSRF_HEADERS)
+            self.assertEqual(mocked_http.call_count, 1)
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["credits_charged"], 2)
+        self.assertEqual(body["credits_remaining"], 3)  # 5 - 2
+        # No search_log_id: an API-sourced hit has no subscriber_records row, and
+        # mobile_lookup_report_pdf reads only subscriber_records — offering a PDF
+        # download here would 404. See app.py comment at the same spot.
+        self.assertNotIn("search_log_id", body)
+
+        # Charged exactly once.
+        self.assertEqual(self.db["bot_users"][1]["credits"], 3)
+        self.assertEqual(len(self.db["credit_transactions"]), 1)
+        self.assertEqual(self.db["credit_transactions"][0]["amount"], 2)
+
+        # The audit row must be truthful: real source, real credits_used, not "No match".
+        self.assertEqual(len(self.db["search_logs"]), 1)
+        log = self.db["search_logs"][0]
+        self.assertEqual(log["credits_used"], 2)
+        self.assertEqual(log["sources_queried"], "Twilio Lookup Service")
+        self.assertEqual(log["case_reference"], "FIR-2026-9001")
+
+    def test_local_miss_with_failing_integration_is_uncharged_and_distinguishable(self):
+        # Case (c): an integration is configured but the outbound call fails. This
+        # must NOT be recorded the same way as a true "no data anywhere" miss.
+        self._add_enabled_twilio_integration()
+        self._login(user_id=1, phone="9999999999")
+        with mock.patch.object(self.app_module, "_http_json", side_effect=Exception("provider timeout")):
+            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000"}, headers=self.CSRF_HEADERS)
+
+        # Same HTTP status as today's true-miss case — don't break the frontend.
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(self.db["bot_users"][1]["credits"], 5)  # untouched, not charged
+        self.assertEqual(self.db["credit_transactions"], [])
+        self.assertEqual(len(self.db["search_logs"]), 1)
+        log = self.db["search_logs"][0]
+        self.assertEqual(log["credits_used"], 0)
+        self.assertEqual(log["sources_queried"], "Lookup failed")
+        self.assertNotEqual(log["sources_queried"], "No match")
 
     def test_race_lost_between_check_and_deduct_returns_402_and_does_not_overspend(self):
         self._login(user_id=1, phone="9999999999")
