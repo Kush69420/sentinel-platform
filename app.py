@@ -39,6 +39,9 @@ from xml.sax.saxutils import escape as xml_escape
 import mysql.connector
 import pyotp
 import qrcode
+import requests
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from reportlab.lib import colors
@@ -754,7 +757,14 @@ def dashboard_page():
 
 @app.route("/admin")
 def admin_page():
-    return render_template("admin.html")
+    # The login card renders from these rather than probing an endpoint, so the
+    # page never briefly offers a door that is switched off.
+    return render_template(
+        "admin.html",
+        google_oauth_enabled=google_oauth_enabled(),
+        password_login_enabled=admin_password_login_enabled(),
+        auth_error=request.args.get("auth_error", ""),
+    )
 
 
 @app.route("/register")
@@ -1170,6 +1180,11 @@ def user_login():
     # deliberately avoided — it would split one account's lockout counter
     # across two tables.
     if _is_admin_username(identifier):
+        # The unified door is a second entrance to the same admin password
+        # check, so it has to honour the same switch — otherwise disabling
+        # password login on /api/admin/login would just move the attack here.
+        if not admin_password_login_enabled():
+            return jsonify({"error": "Password login is disabled. Sign in with Google.", "redirect": "/admin"}), 403
         payload, status = _perform_admin_login(
             identifier,
             password,
@@ -1444,6 +1459,35 @@ def user_password_reset_confirm():
 # ─────────────────────────────────────────────
 # ADMIN AUTH + SECURITY
 # ─────────────────────────────────────────────
+def _establish_admin_session(admin, method="password"):
+    """Put an authenticated admin row into the session and return the login payload.
+
+    Shared by every way of becoming an admin — the password door
+    (_perform_admin_login) and Google sign-in (admin_google_callback) — so the
+    session-fixation fix below cannot be forgotten by whichever one is added
+    next. `method` only labels the audit entry; it grants nothing.
+    """
+    # Regenerate the session on privilege change so a pre-login fixated cookie
+    # cannot be reused as an authenticated admin one (same fix as user_login).
+    session.clear()
+    session.permanent = True
+    session["is_admin"] = True
+    session["admin_id"] = admin["id"]
+    session["admin_name"] = admin["name"]
+    session["admin_role"] = admin["role"]
+    session["admin_auth_method"] = method
+    session["login_at"] = datetime.utcnow().isoformat()
+    session["csrf_token"] = _new_csrf_token()
+    log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()} via {method}")
+    return {
+        "success": True,
+        "name": admin["name"],
+        "role": admin["role"],
+        "csrf_token": session["csrf_token"],
+        "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60")),
+    }
+
+
 def _perform_admin_login(username, password, otp="", recovery_code=""):
     """Authenticate against admin_users and, on success, establish the admin session.
 
@@ -1516,29 +1560,171 @@ def _perform_admin_login(username, password, otp="", recovery_code=""):
     conn.commit()
     conn.close()
 
-    # Regenerate the session on privilege change so a pre-login fixated cookie
-    # cannot be reused as an authenticated admin one (same fix as user_login).
-    session.clear()
-    session.permanent = True
-    session["is_admin"] = True
-    session["admin_id"] = admin["id"]
-    session["admin_name"] = admin["name"]
-    session["admin_role"] = admin["role"]
-    session["login_at"] = datetime.utcnow().isoformat()
-    session["csrf_token"] = _new_csrf_token()
-    log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()}")
-    return {
-        "success": True,
-        "name": admin["name"],
-        "role": admin["role"],
-        "csrf_token": session["csrf_token"],
-        "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60")),
-    }, 200
+    return _establish_admin_session(admin, method="password"), 200
+
+
+# ─────────────────────────────────────────────
+# GOOGLE SIGN-IN FOR THE ADMIN CONSOLE
+#
+# Replaces the local admin password with Google's authorization-code flow, so
+# no admin credential exists in this repo, in the database, or in an operator's
+# head. Two properties carry the security here, and both matter:
+#
+#   1. `google_email` on admin_users is an ALLOW-LIST, never a registration
+#      path. The callback looks up an EXISTING active row by verified email and
+#      refuses the login when there is no match. Auto-creating an admin row on
+#      first sign-in would hand the console to anyone with a Google account.
+#   2. The ID token is verified through google-auth (signature against Google's
+#      rotating JWKS, plus issuer, audience and expiry), not merely decoded.
+#      The `state` and `nonce` values minted at /login are checked on the way
+#      back — state defeats CSRF on the callback, nonce defeats replay of a
+#      token minted for a different session.
+#
+# Password login stays reachable as a break-glass path but is DISABLED by
+# default the moment Google sign-in is configured: set ADMIN_PASSWORD_LOGIN=1
+# to re-enable it if Google is unreachable, the consent screen breaks, or the
+# authorized account is locked out. Losing that escape hatch means losing the
+# platform, so it is deliberately kept rather than deleted.
+# ─────────────────────────────────────────────
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "").strip()
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+
+def google_oauth_enabled() -> bool:
+    """True once all three Google settings are present. Partial configuration
+    counts as disabled — a half-configured flow that redirects to Google and
+    then fails at the callback is worse than a login page that never offers it."""
+    return bool(GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI)
+
+
+def admin_password_login_enabled() -> bool:
+    """Password login is on when Google sign-in isn't configured (nothing else
+    would work), and otherwise only when explicitly re-enabled as break-glass."""
+    if not google_oauth_enabled():
+        return True
+    return os.getenv("ADMIN_PASSWORD_LOGIN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@app.route("/api/admin/auth/google/login")
+def admin_google_login():
+    if not google_oauth_enabled():
+        return redirect("/admin?auth_error=" + urllib.parse.quote("Google sign-in is not configured"))
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    session["google_oauth_state"] = state
+    session["google_oauth_nonce"] = nonce
+    params = {
+        "client_id": GOOGLE_OAUTH_CLIENT_ID,
+        "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "nonce": nonce,
+        # Always show the chooser: without it Google silently reuses whatever
+        # account the browser last used, which on a shared operator machine
+        # means signing in as someone else without noticing.
+        "prompt": "select_account",
+        "access_type": "online",
+    }
+    return redirect(f"{GOOGLE_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}")
+
+
+def _google_auth_failed(reason, admin_id=None, detail=""):
+    """Log the real reason server-side, hand the browser a generic one."""
+    log_activity(admin_id, "google_login_denied", detail or reason, actor_type="admin" if admin_id else "system")
+    return redirect("/admin?auth_error=" + urllib.parse.quote(reason))
+
+
+@app.route("/api/admin/auth/google/callback")
+@rate_limit(max_requests=20, window_seconds=300, per="ip")
+def admin_google_callback():
+    if not google_oauth_enabled():
+        return _google_auth_failed("Google sign-in is not configured")
+
+    # Consume state/nonce on the first attempt whatever happens, so a callback
+    # URL cannot be replayed by re-visiting it from history.
+    expected_state = session.pop("google_oauth_state", None)
+    expected_nonce = session.pop("google_oauth_nonce", None)
+
+    if request.args.get("error"):
+        return _google_auth_failed("Google sign-in was cancelled",
+                                   detail=f"Google returned error={request.args.get('error')}")
+
+    state = request.args.get("state", "")
+    if not expected_state or not hmac.compare_digest(state, expected_state):
+        return _google_auth_failed("Sign-in session expired. Try again.",
+                                   detail=f"OAuth state mismatch from {_client_ip()}")
+
+    code = request.args.get("code", "")
+    if not code:
+        return _google_auth_failed("Google sign-in returned no authorization code")
+
+    try:
+        token_response = requests.post(
+            GOOGLE_TOKEN_ENDPOINT,
+            data={
+                "code": code,
+                "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+            timeout=15,
+        )
+        if token_response.status_code != 200:
+            return _google_auth_failed("Google rejected the sign-in",
+                                       detail=f"token endpoint HTTP {token_response.status_code}")
+        raw_id_token = (token_response.json() or {}).get("id_token", "")
+        if not raw_id_token:
+            return _google_auth_failed("Google returned no identity token")
+        claims = google_id_token.verify_oauth2_token(
+            raw_id_token, google_requests.Request(), GOOGLE_OAUTH_CLIENT_ID
+        )
+    except Exception as exc:  # network failure, bad signature, wrong audience, expired
+        return _google_auth_failed("Could not verify Google sign-in", detail=f"{type(exc).__name__}: {exc}")
+
+    if expected_nonce and claims.get("nonce") != expected_nonce:
+        return _google_auth_failed("Sign-in session expired. Try again.",
+                                   detail=f"OAuth nonce mismatch from {_client_ip()}")
+
+    # An unverified email is attacker-controllable: anyone can claim an address
+    # they do not own until Google has confirmed it.
+    if not claims.get("email_verified"):
+        return _google_auth_failed("This Google account has no verified email address")
+
+    email = (claims.get("email") or "").strip().lower()
+    if not email:
+        return _google_auth_failed("Google returned no email address")
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM admin_users WHERE LOWER(google_email)=%s AND is_active=1", (email,))
+    admin = cursor.fetchone()
+    if not admin:
+        conn.close()
+        # Deliberately does not distinguish "unknown" from "known but disabled":
+        # this page is reachable by anyone, and the difference tells a stranger
+        # whether an address is an admin here.
+        return _google_auth_failed(
+            "This Google account is not authorized for admin access",
+            detail=f"Google sign-in refused for unauthorized address {email} from {_client_ip()}",
+        )
+    cursor.execute("UPDATE admin_users SET failed_login_count=0, locked_until=NULL, last_login_at=NOW() WHERE id=%s", (admin["id"],))
+    conn.commit()
+    conn.close()
+
+    _establish_admin_session(admin, method="google")
+    return redirect("/admin")
 
 
 @app.route("/api/admin/login", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP — same shape as user login
 def admin_login():
+    if not admin_password_login_enabled():
+        return jsonify({"error": "Password login is disabled. Sign in with Google."}), 403
     data = request.json or {}
     payload, status = _perform_admin_login(
         data.get("username", "").strip(),

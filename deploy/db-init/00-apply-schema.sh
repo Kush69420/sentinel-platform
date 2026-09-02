@@ -41,6 +41,11 @@ run migration_selfserve_auth.sql
 # creates the first admin; run it after this script finishes.
 run migration_remove_default_admin.sql
 
+# Adds admin_users.google_email — the allow-list column backing "Sign in with
+# Google" on /admin. Harmless on a deployment that has not configured Google
+# sign-in: the column simply stays NULL everywhere and password login is used.
+run migration_google_admin_oauth.sql
+
 # Not part of CLAUDE.md's canonical four — this one is data, not schema. It marks every
 # catalog service except mobile_lookup as "upcoming" so the dashboard shows a COMING
 # SOON badge rather than letting users click into a dead tool, which matches the

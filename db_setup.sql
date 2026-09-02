@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS admin_users (
     twofa_enabled TINYINT DEFAULT 0,
     twofa_secret TEXT,
     recovery_codes_hash TEXT,
+    -- Verified Google account authorized to sign in as this admin (allow-list,
+    -- not registration — see migration_google_admin_oauth.sql). NULL means this
+    -- admin can only use password login. UNIQUE tolerates many NULLs.
+    google_email VARCHAR(255) NULL UNIQUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
