@@ -1626,9 +1626,31 @@ def enable_2fa():
 @app.route("/api/admin/2fa/disable", methods=["POST"])
 @admin_required
 def disable_2fa():
+    # Disabling 2FA is itself a security-relevant action (it removes the
+    # second factor from a compromised-password attack), so it requires the
+    # same proof-of-presence as changing a password: the current password OR
+    # a fresh valid OTP, checked before anything is cleared. Mirrors
+    # user_password_change()'s re-auth pattern and admin login's OTP check.
+    data = request.json or {}
+    current_password = data.get("current_password", "")
+    otp = (data.get("otp") or "").strip()
     admin_id = session.get("admin_id")
     conn = get_db()
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT password_hash, twofa_secret FROM admin_users WHERE id=%s", (admin_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Admin not found"}), 404
+
+    verified = bool(current_password) and check_password_hash(row["password_hash"], current_password)
+    if not verified and otp and row.get("twofa_secret"):
+        verified = pyotp.TOTP(decrypt_text(row["twofa_secret"])).verify(otp, valid_window=1)
+    if not verified:
+        conn.close()
+        log_activity(admin_id, "2fa_disable_denied", f"{session.get('admin_name')} failed re-auth attempting to disable 2FA")
+        return jsonify({"error": "Current password or a valid 2FA code is required to disable 2FA"}), 401
+
     cursor.execute("UPDATE admin_users SET twofa_enabled=0, twofa_secret=NULL, recovery_codes_hash=NULL WHERE id=%s", (admin_id,))
     conn.commit()
     conn.close()
