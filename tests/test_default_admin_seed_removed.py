@@ -122,17 +122,21 @@ class _FakeCursor:
             row = self.db["admins"].get(params[0])
             self._result = dict(row) if row else None
         elif q.startswith("UPDATE admin_users SET name=%s, password_hash=%s, role=%s, is_active=1"):
-            name, password_hash, role, admin_id = params
+            # google_email was appended to this statement when Google sign-in
+            # landed (migration_google_admin_oauth.sql); admin_id stays last.
+            name, password_hash, role, google_email, admin_id = params
             self.db["admins_by_id"][admin_id].update(
                 name=name, password_hash=password_hash, role=role,
+                google_email=google_email,
                 is_active=1, failed_login_count=0, locked_until=None,
             )
         elif q.startswith("INSERT INTO admin_users"):
-            name, username, password_hash, role = params
+            name, username, password_hash, role, google_email = params
             new_id = max(self.db["admins_by_id"]) + 1 if self.db["admins_by_id"] else 1
             row = {
                 "id": new_id, "name": name, "username": username,
                 "password_hash": password_hash, "role": role, "is_active": 1,
+                "google_email": google_email,
             }
             self.db["admins"][username] = row
             self.db["admins_by_id"][new_id] = row
