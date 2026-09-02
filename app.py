@@ -3527,17 +3527,106 @@ def admin_service_item_v2(service_id):
         conn.rollback(); conn.close(); return jsonify({"error":f"Database Write Failed: {exc}"}),400
     conn.close(); log_audit("tool_edited",f"Edited tool {old['name']}",old,d); return jsonify({"success":True})
 
+
+# ─────────────────────────────────────────────
+# CLI TOOL EXECUTION — argv-safe substitution + binary allow-list
+#
+# admin_cli_test_v2() below runs an admin-configured command template
+# (services.external_command) with an admin-supplied query spliced in. The
+# old implementation did `template.replace('{query}', query)` on the raw
+# string BEFORE shlex.split(), so a query containing spaces/quotes/`--flags`
+# was re-parsed by shlex into extra argv elements — not shell injection (no
+# shell=True), but full argument injection into whatever binary the admin's
+# service row points at. The admin also fully controls that binary via
+# POST /api/admin/services (app.py's external_command field, ~line 3497), so
+# this is an admin-to-arbitrary-command chain, not just admin-to-admin-tool.
+#
+# Two independent fixes, both required:
+#   1. _build_cli_argv() shlex-splits the TEMPLATE first, then substitutes
+#      {query} into each already-split token individually. Query content can
+#      then never be re-parsed into extra argv elements.
+#   2. _resolve_cli_binary() is a second, independent boundary: even with (1)
+#      fixed, an admin can still create a service whose external_command
+#      points at anything on PATH. Only a binary listed in
+#      CLI_TOOL_ALLOWED_BINARIES (env-configured, empty/deny-by-default) may
+#      actually run, resolved to an absolute, symlink-free real path on both
+#      sides of the comparison so a relative path, `../`, or a symlink can't
+#      slip past the list.
+# ─────────────────────────────────────────────
+CLI_TOOL_ALLOWED_BINARIES = frozenset(
+    b.strip() for b in os.getenv("CLI_TOOL_ALLOWED_BINARIES", "").split(",") if b.strip()
+)
+
+
+def _build_cli_argv(template: str, query) -> list[str]:
+    """Shlex-split `template`, then substitute {query} into each resulting
+    token individually (so it also works when {query} sits inside a larger
+    token, e.g. "--target={query}"). Raises ValueError on a malformed
+    template (unbalanced quotes) or an empty/whitespace-only one — both are
+    admin configuration errors, not something to crash the request on.
+    """
+    try:
+        tokens = shlex.split(template or "")
+    except ValueError as exc:
+        raise ValueError(f"malformed command template: {exc}") from exc
+    if not tokens:
+        raise ValueError("external_command missing")
+    return [tok.replace("{query}", str(query)) for tok in tokens]
+
+
+def _resolve_realpath(binary: str) -> str | None:
+    """Resolve a bare name (via $PATH) or a path to an absolute, symlink-
+    resolved real path. Returns None if it can't be found/resolved."""
+    if not binary:
+        return None
+    candidate = binary if os.path.sep in binary else shutil.which(binary)
+    if not candidate:
+        return None
+    if not os.path.isabs(candidate):
+        candidate = os.path.abspath(candidate)
+    return os.path.realpath(candidate)
+
+
+def _resolve_cli_binary(argv0: str) -> str | None:
+    """Return argv0's resolved real path if (and only if) it matches an
+    entry in CLI_TOOL_ALLOWED_BINARIES, each resolved the same way — so a
+    relative path, `../`, or a symlink pointing outside the allow-list
+    cannot slip past. Returns None (never raises) if argv0 doesn't resolve
+    to an existing file, or isn't on the list — including when the list is
+    empty, which denies everything by default.
+    """
+    if not CLI_TOOL_ALLOWED_BINARIES:
+        return None
+    resolved = _resolve_realpath(argv0)
+    if not resolved or not os.path.isfile(resolved):
+        return None
+    allowed_resolved = {_resolve_realpath(b) for b in CLI_TOOL_ALLOWED_BINARIES}
+    return resolved if resolved in allowed_resolved else None
+
+
 @app.route("/api/admin/tools/<int:service_id>/cli-test", methods=["POST"])
 @admin_required
 def admin_cli_test_v2(service_id):
     q=(request.json or {}).get('query','test'); conn=get_db(); cur=conn.cursor(dictionary=True); cur.execute("SELECT * FROM services WHERE id=%s",(service_id,)); svc=cur.fetchone();
     if not svc: conn.close(); return jsonify({"error":"Tool not found"}),404
     if not svc.get('allow_cli_execution'): conn.close(); return jsonify({"error":"CLI execution disabled for this tool"}),403
-    cmd=(svc.get('external_command') or '').replace('{query}',str(q));
-    if not cmd: conn.close(); return jsonify({"error":"external_command missing"}),400
-    cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at) VALUES (%s,%s,%s,'running',NOW())",(service_id,session.get('user_id'),cmd)); jid=cur.lastrowid; conn.commit(); start=time.time()
+    template=svc.get('external_command') or ''
     try:
-        proc=subprocess.run(shlex.split(cmd),capture_output=True,text=True,timeout=int(svc.get('timeout_seconds') or 60),cwd=BASE_DIR); status='success' if proc.returncode==0 else 'failed'; rt=int((time.time()-start)*1000)
+        argv=_build_cli_argv(template,q)
+    except ValueError as exc:
+        reason=str(exc)
+        cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at,finished_at,stderr) VALUES (%s,%s,%s,'failed',NOW(),NOW(),%s)",(service_id,session.get('user_id'),template,reason)); jid=cur.lastrowid; conn.commit(); conn.close()
+        return jsonify({"error":reason,"job_id":jid}),400
+    cmd_display=' '.join(argv)
+    resolved=_resolve_cli_binary(argv[0])
+    if not resolved:
+        reason=f"Binary '{argv[0]}' is not permitted by CLI_TOOL_ALLOWED_BINARIES"
+        cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at,finished_at,stderr) VALUES (%s,%s,%s,'failed',NOW(),NOW(),%s)",(service_id,session.get('user_id'),cmd_display,reason)); jid=cur.lastrowid; conn.commit(); conn.close()
+        return jsonify({"error":reason,"job_id":jid}),403
+    argv[0]=resolved
+    cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at) VALUES (%s,%s,%s,'running',NOW())",(service_id,session.get('user_id'),cmd_display)); jid=cur.lastrowid; conn.commit(); start=time.time()
+    try:
+        proc=subprocess.run(argv,capture_output=True,text=True,timeout=int(svc.get('timeout_seconds') or 60),cwd=BASE_DIR); status='success' if proc.returncode==0 else 'failed'; rt=int((time.time()-start)*1000)
         cur.execute("UPDATE external_tool_jobs SET status=%s,exit_code=%s,stdout=%s,stderr=%s,runtime_ms=%s,finished_at=NOW() WHERE id=%s",(status,proc.returncode,(proc.stdout or '')[:200000],(proc.stderr or '')[:50000],rt,jid)); conn.commit(); conn.close(); return jsonify({"success":proc.returncode==0,"job_id":jid,"stdout":proc.stdout,"stderr":proc.stderr,"runtime_ms":rt}), (200 if proc.returncode==0 else 500)
     except Exception as exc:
         cur.execute("UPDATE external_tool_jobs SET status='failed',stderr=%s,finished_at=NOW() WHERE id=%s",(str(exc),jid)); conn.commit(); conn.close(); return jsonify({"error":str(exc),"job_id":jid}),500
