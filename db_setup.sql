@@ -20,13 +20,27 @@ CREATE TABLE IF NOT EXISTS admin_users (
     twofa_enabled TINYINT DEFAULT 0,
     twofa_secret TEXT,
     recovery_codes_hash TEXT,
+    -- Verified Google account authorized to sign in as this admin (allow-list,
+    -- not registration — see migration_google_admin_oauth.sql). NULL means this
+    -- admin can only use password login. UNIQUE tolerates many NULLs.
+    google_email VARCHAR(255) NULL UNIQUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Default admin: username=admin, password=admin123. CHANGE IMMEDIATELY.
-INSERT INTO admin_users (name, username, password_hash, role)
-VALUES ('Super Admin', 'admin', 'pbkdf2:sha256:600000$sentinelsalt1234$759d3c0805511946c952611fa5ce9b5f7b6b339fc60d70a80ee32657a174546a', 'super_admin')
-ON DUPLICATE KEY UPDATE username=username;
+-- No default admin is seeded here on purpose. A checked-into-git credential
+-- (this file used to insert username=admin / password=admin123 with a static
+-- salt) means everyone who ever cloned the repo can log in as super_admin on
+-- any deployment that forgot to change it — and nothing enforced that change.
+-- Create the first admin explicitly instead, after this file has run:
+--   python -m tools.bootstrap_admin --username admin --name "Ops Admin"
+-- (omit --password to have it generate one and print it once). See that
+-- script's docstring, and CLAUDE.md's deploy checklist, for details.
+--
+-- Upgrading a database that was already initialised by the OLD version of
+-- this file: removing the INSERT here does nothing for you, since
+-- CREATE TABLE IF NOT EXISTS above is a no-op on an existing table and the
+-- old INSERT simply never runs again. Run migration_remove_default_admin.sql
+-- — it neutralizes that already-seeded row explicitly.
 
 -- ── LEA APPLICATIONS ──
 CREATE TABLE IF NOT EXISTS lea_applications (

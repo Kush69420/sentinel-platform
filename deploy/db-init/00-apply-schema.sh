@@ -32,6 +32,20 @@ run migration_admin_customization.sql
 run migration_fix_import_errors.sql
 run migration_selfserve_auth.sql
 
+# Neutralizes the old seeded admin/admin123 row IF this datadir was ever
+# initialised by an older db_setup.sql that still inserted it. On a truly
+# fresh datadir (the case this script exists for) db_setup.sql above no
+# longer seeds anything, so this matches zero rows and is a harmless no-op —
+# it stays in the run list anyway so a rebuilt image is safe to run against
+# a datadir that predates this fix. tools/bootstrap_admin.py is what actually
+# creates the first admin; run it after this script finishes.
+run migration_remove_default_admin.sql
+
+# Adds admin_users.google_email — the allow-list column backing "Sign in with
+# Google" on /admin. Harmless on a deployment that has not configured Google
+# sign-in: the column simply stays NULL everywhere and password login is used.
+run migration_google_admin_oauth.sql
+
 # Not part of CLAUDE.md's canonical four — this one is data, not schema. It marks every
 # catalog service except mobile_lookup as "upcoming" so the dashboard shows a COMING
 # SOON badge rather than letting users click into a dead tool, which matches the

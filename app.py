@@ -39,6 +39,9 @@ from xml.sax.saxutils import escape as xml_escape
 import mysql.connector
 import pyotp
 import qrcode
+import requests
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from reportlab.lib import colors
@@ -754,7 +757,14 @@ def dashboard_page():
 
 @app.route("/admin")
 def admin_page():
-    return render_template("admin.html")
+    # The login card renders from these rather than probing an endpoint, so the
+    # page never briefly offers a door that is switched off.
+    return render_template(
+        "admin.html",
+        google_oauth_enabled=google_oauth_enabled(),
+        password_login_enabled=admin_password_login_enabled(),
+        auth_error=request.args.get("auth_error", ""),
+    )
 
 
 @app.route("/register")
@@ -1170,6 +1180,11 @@ def user_login():
     # deliberately avoided — it would split one account's lockout counter
     # across two tables.
     if _is_admin_username(identifier):
+        # The unified door is a second entrance to the same admin password
+        # check, so it has to honour the same switch — otherwise disabling
+        # password login on /api/admin/login would just move the attack here.
+        if not admin_password_login_enabled():
+            return jsonify({"error": "Password login is disabled. Sign in with Google.", "redirect": "/admin"}), 403
         payload, status = _perform_admin_login(
             identifier,
             password,
@@ -1444,6 +1459,35 @@ def user_password_reset_confirm():
 # ─────────────────────────────────────────────
 # ADMIN AUTH + SECURITY
 # ─────────────────────────────────────────────
+def _establish_admin_session(admin, method="password"):
+    """Put an authenticated admin row into the session and return the login payload.
+
+    Shared by every way of becoming an admin — the password door
+    (_perform_admin_login) and Google sign-in (admin_google_callback) — so the
+    session-fixation fix below cannot be forgotten by whichever one is added
+    next. `method` only labels the audit entry; it grants nothing.
+    """
+    # Regenerate the session on privilege change so a pre-login fixated cookie
+    # cannot be reused as an authenticated admin one (same fix as user_login).
+    session.clear()
+    session.permanent = True
+    session["is_admin"] = True
+    session["admin_id"] = admin["id"]
+    session["admin_name"] = admin["name"]
+    session["admin_role"] = admin["role"]
+    session["admin_auth_method"] = method
+    session["login_at"] = datetime.utcnow().isoformat()
+    session["csrf_token"] = _new_csrf_token()
+    log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()} via {method}")
+    return {
+        "success": True,
+        "name": admin["name"],
+        "role": admin["role"],
+        "csrf_token": session["csrf_token"],
+        "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60")),
+    }
+
+
 def _perform_admin_login(username, password, otp="", recovery_code=""):
     """Authenticate against admin_users and, on success, establish the admin session.
 
@@ -1516,29 +1560,171 @@ def _perform_admin_login(username, password, otp="", recovery_code=""):
     conn.commit()
     conn.close()
 
-    # Regenerate the session on privilege change so a pre-login fixated cookie
-    # cannot be reused as an authenticated admin one (same fix as user_login).
-    session.clear()
-    session.permanent = True
-    session["is_admin"] = True
-    session["admin_id"] = admin["id"]
-    session["admin_name"] = admin["name"]
-    session["admin_role"] = admin["role"]
-    session["login_at"] = datetime.utcnow().isoformat()
-    session["csrf_token"] = _new_csrf_token()
-    log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()}")
-    return {
-        "success": True,
-        "name": admin["name"],
-        "role": admin["role"],
-        "csrf_token": session["csrf_token"],
-        "session_timeout_min": int(os.getenv("SESSION_TIMEOUT_MIN", "60")),
-    }, 200
+    return _establish_admin_session(admin, method="password"), 200
+
+
+# ─────────────────────────────────────────────
+# GOOGLE SIGN-IN FOR THE ADMIN CONSOLE
+#
+# Replaces the local admin password with Google's authorization-code flow, so
+# no admin credential exists in this repo, in the database, or in an operator's
+# head. Two properties carry the security here, and both matter:
+#
+#   1. `google_email` on admin_users is an ALLOW-LIST, never a registration
+#      path. The callback looks up an EXISTING active row by verified email and
+#      refuses the login when there is no match. Auto-creating an admin row on
+#      first sign-in would hand the console to anyone with a Google account.
+#   2. The ID token is verified through google-auth (signature against Google's
+#      rotating JWKS, plus issuer, audience and expiry), not merely decoded.
+#      The `state` and `nonce` values minted at /login are checked on the way
+#      back — state defeats CSRF on the callback, nonce defeats replay of a
+#      token minted for a different session.
+#
+# Password login stays reachable as a break-glass path but is DISABLED by
+# default the moment Google sign-in is configured: set ADMIN_PASSWORD_LOGIN=1
+# to re-enable it if Google is unreachable, the consent screen breaks, or the
+# authorized account is locked out. Losing that escape hatch means losing the
+# platform, so it is deliberately kept rather than deleted.
+# ─────────────────────────────────────────────
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "").strip()
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+
+def google_oauth_enabled() -> bool:
+    """True once all three Google settings are present. Partial configuration
+    counts as disabled — a half-configured flow that redirects to Google and
+    then fails at the callback is worse than a login page that never offers it."""
+    return bool(GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI)
+
+
+def admin_password_login_enabled() -> bool:
+    """Password login is on when Google sign-in isn't configured (nothing else
+    would work), and otherwise only when explicitly re-enabled as break-glass."""
+    if not google_oauth_enabled():
+        return True
+    return os.getenv("ADMIN_PASSWORD_LOGIN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@app.route("/api/admin/auth/google/login")
+def admin_google_login():
+    if not google_oauth_enabled():
+        return redirect("/admin?auth_error=" + urllib.parse.quote("Google sign-in is not configured"))
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    session["google_oauth_state"] = state
+    session["google_oauth_nonce"] = nonce
+    params = {
+        "client_id": GOOGLE_OAUTH_CLIENT_ID,
+        "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "nonce": nonce,
+        # Always show the chooser: without it Google silently reuses whatever
+        # account the browser last used, which on a shared operator machine
+        # means signing in as someone else without noticing.
+        "prompt": "select_account",
+        "access_type": "online",
+    }
+    return redirect(f"{GOOGLE_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}")
+
+
+def _google_auth_failed(reason, admin_id=None, detail=""):
+    """Log the real reason server-side, hand the browser a generic one."""
+    log_activity(admin_id, "google_login_denied", detail or reason, actor_type="admin" if admin_id else "system")
+    return redirect("/admin?auth_error=" + urllib.parse.quote(reason))
+
+
+@app.route("/api/admin/auth/google/callback")
+@rate_limit(max_requests=20, window_seconds=300, per="ip")
+def admin_google_callback():
+    if not google_oauth_enabled():
+        return _google_auth_failed("Google sign-in is not configured")
+
+    # Consume state/nonce on the first attempt whatever happens, so a callback
+    # URL cannot be replayed by re-visiting it from history.
+    expected_state = session.pop("google_oauth_state", None)
+    expected_nonce = session.pop("google_oauth_nonce", None)
+
+    if request.args.get("error"):
+        return _google_auth_failed("Google sign-in was cancelled",
+                                   detail=f"Google returned error={request.args.get('error')}")
+
+    state = request.args.get("state", "")
+    if not expected_state or not hmac.compare_digest(state, expected_state):
+        return _google_auth_failed("Sign-in session expired. Try again.",
+                                   detail=f"OAuth state mismatch from {_client_ip()}")
+
+    code = request.args.get("code", "")
+    if not code:
+        return _google_auth_failed("Google sign-in returned no authorization code")
+
+    try:
+        token_response = requests.post(
+            GOOGLE_TOKEN_ENDPOINT,
+            data={
+                "code": code,
+                "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+            timeout=15,
+        )
+        if token_response.status_code != 200:
+            return _google_auth_failed("Google rejected the sign-in",
+                                       detail=f"token endpoint HTTP {token_response.status_code}")
+        raw_id_token = (token_response.json() or {}).get("id_token", "")
+        if not raw_id_token:
+            return _google_auth_failed("Google returned no identity token")
+        claims = google_id_token.verify_oauth2_token(
+            raw_id_token, google_requests.Request(), GOOGLE_OAUTH_CLIENT_ID
+        )
+    except Exception as exc:  # network failure, bad signature, wrong audience, expired
+        return _google_auth_failed("Could not verify Google sign-in", detail=f"{type(exc).__name__}: {exc}")
+
+    if expected_nonce and claims.get("nonce") != expected_nonce:
+        return _google_auth_failed("Sign-in session expired. Try again.",
+                                   detail=f"OAuth nonce mismatch from {_client_ip()}")
+
+    # An unverified email is attacker-controllable: anyone can claim an address
+    # they do not own until Google has confirmed it.
+    if not claims.get("email_verified"):
+        return _google_auth_failed("This Google account has no verified email address")
+
+    email = (claims.get("email") or "").strip().lower()
+    if not email:
+        return _google_auth_failed("Google returned no email address")
+
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM admin_users WHERE LOWER(google_email)=%s AND is_active=1", (email,))
+    admin = cursor.fetchone()
+    if not admin:
+        conn.close()
+        # Deliberately does not distinguish "unknown" from "known but disabled":
+        # this page is reachable by anyone, and the difference tells a stranger
+        # whether an address is an admin here.
+        return _google_auth_failed(
+            "This Google account is not authorized for admin access",
+            detail=f"Google sign-in refused for unauthorized address {email} from {_client_ip()}",
+        )
+    cursor.execute("UPDATE admin_users SET failed_login_count=0, locked_until=NULL, last_login_at=NOW() WHERE id=%s", (admin["id"],))
+    conn.commit()
+    conn.close()
+
+    _establish_admin_session(admin, method="google")
+    return redirect("/admin")
 
 
 @app.route("/api/admin/login", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=300, per="ip")  # 10 attempts / 5 min per IP — same shape as user login
 def admin_login():
+    if not admin_password_login_enabled():
+        return jsonify({"error": "Password login is disabled. Sign in with Google."}), 403
     data = request.json or {}
     payload, status = _perform_admin_login(
         data.get("username", "").strip(),
@@ -1626,9 +1812,31 @@ def enable_2fa():
 @app.route("/api/admin/2fa/disable", methods=["POST"])
 @admin_required
 def disable_2fa():
+    # Disabling 2FA is itself a security-relevant action (it removes the
+    # second factor from a compromised-password attack), so it requires the
+    # same proof-of-presence as changing a password: the current password OR
+    # a fresh valid OTP, checked before anything is cleared. Mirrors
+    # user_password_change()'s re-auth pattern and admin login's OTP check.
+    data = request.json or {}
+    current_password = data.get("current_password", "")
+    otp = (data.get("otp") or "").strip()
     admin_id = session.get("admin_id")
     conn = get_db()
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT password_hash, twofa_secret FROM admin_users WHERE id=%s", (admin_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Admin not found"}), 404
+
+    verified = bool(current_password) and check_password_hash(row["password_hash"], current_password)
+    if not verified and otp and row.get("twofa_secret"):
+        verified = pyotp.TOTP(decrypt_text(row["twofa_secret"])).verify(otp, valid_window=1)
+    if not verified:
+        conn.close()
+        log_activity(admin_id, "2fa_disable_denied", f"{session.get('admin_name')} failed re-auth attempting to disable 2FA")
+        return jsonify({"error": "Current password or a valid 2FA code is required to disable 2FA"}), 401
+
     cursor.execute("UPDATE admin_users SET twofa_enabled=0, twofa_secret=NULL, recovery_codes_hash=NULL WHERE id=%s", (admin_id,))
     conn.commit()
     conn.close()
@@ -3527,17 +3735,106 @@ def admin_service_item_v2(service_id):
         conn.rollback(); conn.close(); return jsonify({"error":f"Database Write Failed: {exc}"}),400
     conn.close(); log_audit("tool_edited",f"Edited tool {old['name']}",old,d); return jsonify({"success":True})
 
+
+# ─────────────────────────────────────────────
+# CLI TOOL EXECUTION — argv-safe substitution + binary allow-list
+#
+# admin_cli_test_v2() below runs an admin-configured command template
+# (services.external_command) with an admin-supplied query spliced in. The
+# old implementation did `template.replace('{query}', query)` on the raw
+# string BEFORE shlex.split(), so a query containing spaces/quotes/`--flags`
+# was re-parsed by shlex into extra argv elements — not shell injection (no
+# shell=True), but full argument injection into whatever binary the admin's
+# service row points at. The admin also fully controls that binary via
+# POST /api/admin/services (app.py's external_command field, ~line 3497), so
+# this is an admin-to-arbitrary-command chain, not just admin-to-admin-tool.
+#
+# Two independent fixes, both required:
+#   1. _build_cli_argv() shlex-splits the TEMPLATE first, then substitutes
+#      {query} into each already-split token individually. Query content can
+#      then never be re-parsed into extra argv elements.
+#   2. _resolve_cli_binary() is a second, independent boundary: even with (1)
+#      fixed, an admin can still create a service whose external_command
+#      points at anything on PATH. Only a binary listed in
+#      CLI_TOOL_ALLOWED_BINARIES (env-configured, empty/deny-by-default) may
+#      actually run, resolved to an absolute, symlink-free real path on both
+#      sides of the comparison so a relative path, `../`, or a symlink can't
+#      slip past the list.
+# ─────────────────────────────────────────────
+CLI_TOOL_ALLOWED_BINARIES = frozenset(
+    b.strip() for b in os.getenv("CLI_TOOL_ALLOWED_BINARIES", "").split(",") if b.strip()
+)
+
+
+def _build_cli_argv(template: str, query) -> list[str]:
+    """Shlex-split `template`, then substitute {query} into each resulting
+    token individually (so it also works when {query} sits inside a larger
+    token, e.g. "--target={query}"). Raises ValueError on a malformed
+    template (unbalanced quotes) or an empty/whitespace-only one — both are
+    admin configuration errors, not something to crash the request on.
+    """
+    try:
+        tokens = shlex.split(template or "")
+    except ValueError as exc:
+        raise ValueError(f"malformed command template: {exc}") from exc
+    if not tokens:
+        raise ValueError("external_command missing")
+    return [tok.replace("{query}", str(query)) for tok in tokens]
+
+
+def _resolve_realpath(binary: str) -> str | None:
+    """Resolve a bare name (via $PATH) or a path to an absolute, symlink-
+    resolved real path. Returns None if it can't be found/resolved."""
+    if not binary:
+        return None
+    candidate = binary if os.path.sep in binary else shutil.which(binary)
+    if not candidate:
+        return None
+    if not os.path.isabs(candidate):
+        candidate = os.path.abspath(candidate)
+    return os.path.realpath(candidate)
+
+
+def _resolve_cli_binary(argv0: str) -> str | None:
+    """Return argv0's resolved real path if (and only if) it matches an
+    entry in CLI_TOOL_ALLOWED_BINARIES, each resolved the same way — so a
+    relative path, `../`, or a symlink pointing outside the allow-list
+    cannot slip past. Returns None (never raises) if argv0 doesn't resolve
+    to an existing file, or isn't on the list — including when the list is
+    empty, which denies everything by default.
+    """
+    if not CLI_TOOL_ALLOWED_BINARIES:
+        return None
+    resolved = _resolve_realpath(argv0)
+    if not resolved or not os.path.isfile(resolved):
+        return None
+    allowed_resolved = {_resolve_realpath(b) for b in CLI_TOOL_ALLOWED_BINARIES}
+    return resolved if resolved in allowed_resolved else None
+
+
 @app.route("/api/admin/tools/<int:service_id>/cli-test", methods=["POST"])
 @admin_required
 def admin_cli_test_v2(service_id):
     q=(request.json or {}).get('query','test'); conn=get_db(); cur=conn.cursor(dictionary=True); cur.execute("SELECT * FROM services WHERE id=%s",(service_id,)); svc=cur.fetchone();
     if not svc: conn.close(); return jsonify({"error":"Tool not found"}),404
     if not svc.get('allow_cli_execution'): conn.close(); return jsonify({"error":"CLI execution disabled for this tool"}),403
-    cmd=(svc.get('external_command') or '').replace('{query}',str(q));
-    if not cmd: conn.close(); return jsonify({"error":"external_command missing"}),400
-    cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at) VALUES (%s,%s,%s,'running',NOW())",(service_id,session.get('user_id'),cmd)); jid=cur.lastrowid; conn.commit(); start=time.time()
+    template=svc.get('external_command') or ''
     try:
-        proc=subprocess.run(shlex.split(cmd),capture_output=True,text=True,timeout=int(svc.get('timeout_seconds') or 60),cwd=BASE_DIR); status='success' if proc.returncode==0 else 'failed'; rt=int((time.time()-start)*1000)
+        argv=_build_cli_argv(template,q)
+    except ValueError as exc:
+        reason=str(exc)
+        cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at,finished_at,stderr) VALUES (%s,%s,%s,'failed',NOW(),NOW(),%s)",(service_id,session.get('user_id'),template,reason)); jid=cur.lastrowid; conn.commit(); conn.close()
+        return jsonify({"error":reason,"job_id":jid}),400
+    cmd_display=' '.join(argv)
+    resolved=_resolve_cli_binary(argv[0])
+    if not resolved:
+        reason=f"Binary '{argv[0]}' is not permitted by CLI_TOOL_ALLOWED_BINARIES"
+        cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at,finished_at,stderr) VALUES (%s,%s,%s,'failed',NOW(),NOW(),%s)",(service_id,session.get('user_id'),cmd_display,reason)); jid=cur.lastrowid; conn.commit(); conn.close()
+        return jsonify({"error":reason,"job_id":jid}),403
+    argv[0]=resolved
+    cur.execute("INSERT INTO external_tool_jobs (service_id,user_id,command,status,started_at) VALUES (%s,%s,%s,'running',NOW())",(service_id,session.get('user_id'),cmd_display)); jid=cur.lastrowid; conn.commit(); start=time.time()
+    try:
+        proc=subprocess.run(argv,capture_output=True,text=True,timeout=int(svc.get('timeout_seconds') or 60),cwd=BASE_DIR); status='success' if proc.returncode==0 else 'failed'; rt=int((time.time()-start)*1000)
         cur.execute("UPDATE external_tool_jobs SET status=%s,exit_code=%s,stdout=%s,stderr=%s,runtime_ms=%s,finished_at=NOW() WHERE id=%s",(status,proc.returncode,(proc.stdout or '')[:200000],(proc.stderr or '')[:50000],rt,jid)); conn.commit(); conn.close(); return jsonify({"success":proc.returncode==0,"job_id":jid,"stdout":proc.stdout,"stderr":proc.stderr,"runtime_ms":rt}), (200 if proc.returncode==0 else 500)
     except Exception as exc:
         cur.execute("UPDATE external_tool_jobs SET status='failed',stderr=%s,finished_at=NOW() WHERE id=%s",(str(exc),jid)); conn.commit(); conn.close(); return jsonify({"error":str(exc),"job_id":jid}),500

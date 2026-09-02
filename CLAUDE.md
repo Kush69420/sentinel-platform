@@ -18,9 +18,21 @@ Do these in order once the database server is provisioned:
    mysql -u sentinel_user1 -p sentinel_db < migration_fix_import_errors.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_selfserve_auth.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_activity_log_actor.sql
+   mysql -u sentinel_user1 -p sentinel_db < migration_remove_default_admin.sql
+   mysql -u sentinel_user1 -p sentinel_db < migration_google_admin_oauth.sql
    ```
    There is no migration runner and no version tracking — nothing records what a given
    database has had applied. Adding a `schema_migrations` table is a Day-4 item.
+
+   `db_setup.sql` no longer seeds a default admin (see "Critical" below) — after the
+   above, create the first real admin explicitly:
+   ```bash
+   python -m tools.bootstrap_admin --username admin --name "Ops Admin"
+   ```
+   Omit `--password` to have it generate one and print it once; it is not recoverable
+   after that. `migration_remove_default_admin.sql` only neutralizes an old seeded row
+   if one already exists on this database — it does not create a usable admin by
+   itself, so this step is required on every deployment, fresh or upgraded.
 
 2. **Copy the new keys from `.env.example` into `.env`**:
    `TRUSTED_PROXY_COUNT`, `PAYMENTS_PROVIDER`, `PASSWORD_RESET_TTL_HOURS`.
@@ -54,6 +66,69 @@ Do these in order once the database server is provisioned:
    unset — an unset value is treated as production-like) plus real `SECRET_KEY` and
    `ENCRYPTION_KEY` values before the app will boot at all.
 
+## ⚠️ Google sign-in for the admin console (added 2026-09-02, `phase1-deploy-blockers`)
+
+`/admin` can now offer "Sign in with Google" instead of (or alongside) the
+username/password form. It is off until configured — nothing changes for a
+deployment that does not set the env vars below.
+
+**Env vars** (`.env.example` / `deploy/env.app.example` have the full comments):
+
+- `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI`
+  — all three must be set for Google sign-in to appear at all
+  (`google_oauth_enabled()` in `app.py` requires all three; a partial set is
+  treated as fully off, deliberately — a half-configured flow that redirects
+  to Google and then fails at the callback is worse than never offering the
+  button).
+- `ADMIN_PASSWORD_LOGIN` — break-glass. The moment the three Google vars above
+  are all set, the username/password door on both `/api/admin/login` and the
+  admin branch of `/api/user/login` is switched OFF by default. Set
+  `ADMIN_PASSWORD_LOGIN=1` to force it back on. This exists so a locked-out
+  Google account or a broken Google consent screen cannot lock every admin out
+  of the platform at once — leave it unset/`0` in normal operation, flip it to
+  `1` only to regain access, then set it back.
+
+**Redirect URI**: `GOOGLE_OAUTH_REDIRECT_URI` must be registered in Google
+Cloud Console → APIs & Services → Credentials, character-for-character, or
+Google refuses the callback with `redirect_uri_mismatch`. It must also be a
+stable `https://` host — a rotating quick-tunnel URL (see the homelab NAS
+deployment) cannot work here, since it would need re-registering every time
+the tunnel rotates.
+
+**Critical — the CD pipeline will NOT apply this migration to the live NAS
+database.** `deploy/db-init/00-apply-schema.sh` (which runs
+`migration_google_admin_oauth.sql`, per the schema-order list above) only
+executes when MySQL's `docker-entrypoint-initdb.d` fires — and that only
+happens on an **empty** datadir, i.e. first initialization of a fresh
+container. The live database already has data, so a redeploy will **not** run
+this script and will **not** add `admin_users.google_email`. It must be
+applied by hand, once:
+
+```bash
+mysql -u sentinel_user1 -p sentinel_db < migration_google_admin_oauth.sql
+```
+
+Until that is run, `admin_users.google_email` does not exist, and the Google
+callback's `SELECT ... WHERE LOWER(google_email)=%s` would error. That is
+harmless *only* for as long as `GOOGLE_OAUTH_*` stay unset on that host —
+`google_oauth_enabled()` gates both the login and callback routes closed
+before the query ever runs, so nothing breaks until someone sets the three
+Google env vars without having also run this migration by hand first. Do both
+together.
+
+**Authorized account**: as of this writing the only address authorized to use
+the Google button on the live deployment is `kushagr250@gmail.com`. That
+authorization lives in the database (`admin_users.google_email`), not in
+code — it was granted with:
+
+```bash
+python -m tools.bootstrap_admin --username admin --name "Ops Admin" --google-email kushagr250@gmail.com
+```
+
+Authorizing another address means running `bootstrap_admin.py` again (with
+`--force` if rotating an existing row) — there is no self-registration path,
+by design (see the migration file's header comment for why).
+
 ## ⚠️ Open — `migration_activity_log_actor.sql` is NOT applied to the live DB (2026-08-26)
 
 The code that depends on it is already deployed (merged to `main` as `5ac30d8`); the
@@ -85,22 +160,28 @@ the live importer actually writes, so any `import_batches` row marked `rolled_ba
 still have its rows present. Future rollbacks are fixed; the old ones were never
 cleaned up and nothing in the app will tell you which.
 
-Still open and *not* covered by the above: `admin`/`admin123` seed + `role_required`
-rollout (intentionally deferred together, see the Decision note below — now tied to a
-planned OAuth2 implementation), the CLI-execution-endpoint RBAC gap, and Day 5 packaging.
+Still open and *not* covered by the above: `role_required` rollout, the
+CLI-execution-endpoint RBAC gap (both intentionally deferred, see the Decision note
+below — now tied to a planned OAuth2 implementation), and Day 5 packaging.
 `app.run(debug=True, host="0.0.0.0")` is still the only way to start the app — the
 Werkzeug interactive debugger is remote code execution, so **do not expose this as-is**.
 The in-process rate limiter (`_rate_limiter` in `app.py`) also has a real deployment
 caveat that isn't a bug to fix — see "Known Issues" below.
+
+**Update (2026-09-02):** the `admin`/`admin123` seed half of that pairing has been
+fixed on its own, ahead of RBAC/OAuth2 — see the Phase-1 deploy-blocker note directly
+below the Decision note. `role_required` rollout and the CLI-endpoint RBAC gap remain
+deferred exactly as the Decision describes; only the seed removal was carved out.
 
 ## Reminder (2026-08-10)
 
 Follow up on the "Known Issues / Security Debt" list below. As of 2026-08-10,
 two of the three original Critical items are fixed and shipped: the stored
 XSS in the admin LEA verification queue, and the unauthenticated CDR/IPDR
-workspace endpoint (both now require `@admin_required`). Only the hardcoded
-default admin credential remains open, and it's intentionally deferred (see
-Decision below), not forgotten.
+workspace endpoint (both now require `@admin_required`). The hardcoded
+default admin credential was open and intentionally deferred (see Decision
+below) until it was fixed on `phase1-deploy-blockers` — see the note directly
+below this Decision.
 
 **Decision (2026-08-10, updated 2026-08-14):** the hardcoded default admin
 credential item is intentionally deferred, not skipped. It will be fixed
@@ -115,14 +196,27 @@ session-based `admin_users.role` column. Concretely, that means don't apply
 `db_setup.sql`, and don't gate `/api/admin/tools/<id>/cli-test` by role as a
 one-off ahead of that pass — it will be redone once OAuth2 lands anyway.
 
+**Superseding note (2026-09-02):** the seed-removal half of this Decision was
+carved out and fixed as a standalone Phase-1 deploy blocker, explicitly
+requested ahead of the OAuth2/RBAC pass rather than bundled with it —
+`db_setup.sql` no longer seeds `admin`/`admin123`, `migration_remove_default_admin.sql`
+neutralizes that row on any database that already has it, and
+`tools/bootstrap_admin.py` creates the first real admin. This did **not** touch
+RBAC: `role_required` is still applied to zero routes, the `admin_users.role`
+column and its enum are untouched, and the CLI-endpoint RBAC gap is still open
+— those three remain deferred to the OAuth2 pass exactly as this Decision
+describes. Do not treat this as license to revisit them.
+
 **Reminder (2026-08-14):** Day 2 of the 5-day security hardening plan is
 complete on `day2-security` (fail-fast secrets, CSRF protection, session
 cookie hardening + security headers, `/api/admin/login` rate limit,
 `/uploads` path-traversal guard, `/api/events` auth + bounded connections,
 PDF injection escaping — see `docs/DAY2_HANDOVER.md`). Everything in the Critical/
 High/Medium/Low lists below that Day 2 touched is marked fixed inline; the
-RBAC-adjacent items (admin seed, `role_required` rollout, CLI-endpoint RBAC
-gap) are unchanged and still deferred per the Decision above. `app.run(debug=
+RBAC-adjacent items (`role_required` rollout, CLI-endpoint RBAC gap) are
+unchanged and still deferred per the Decision above — the admin-seed item in
+that same parenthetical was later carved out and fixed, see the 2026-09-02
+note above. `app.run(debug=
 True, host="0.0.0.0")` is unchanged — still Day 5 packaging scope.
 
 ## Known Issues / Security Debt (pre-existing, not yet patched)
@@ -144,13 +238,15 @@ fixes already shipped — those are done.
 
 ### Critical
 
-- **Hardcoded default admin credential, no forced rotation**
-  (`db_setup.sql`, `INSERT INTO admin_users ... ('admin', <hash of
-  'admin123'>, 'super_admin')`). Runs on every fresh setup; only a comment
-  says "CHANGE IMMEDIATELY," nothing enforces it. Fix: force a password
-  change on first login for this seeded account, or drop the seed and
-  require an explicit admin-creation step during deploy. **Deferred** —
-  see Decision above; will be fixed together with RBAC enforcement.
+- ~~Hardcoded default admin credential, no forced rotation~~ — **FIXED on
+  `phase1-deploy-blockers` (2026-09-02).** `db_setup.sql` no longer seeds
+  `admin`/`admin123`; `migration_remove_default_admin.sql` disables that row
+  on any database that already has it (matches the exact old hash only, so a
+  rotated real credential is left alone); `tools/bootstrap_admin.py` creates
+  the first real admin, either from `--password` or a generated one printed
+  once. See the "Update (2026-09-02)" and "Superseding note" above — this
+  was carved out of the RBAC-paired deferral on explicit instruction; RBAC
+  enforcement itself is untouched and still deferred.
 
 ### High
 
