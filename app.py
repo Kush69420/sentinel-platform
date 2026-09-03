@@ -52,6 +52,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from flask import (
     Flask,
     Response,
+    after_this_request,
     has_request_context,
     jsonify,
     redirect,
@@ -60,6 +61,7 @@ from flask import (
     send_from_directory,
     session,
 )
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
@@ -107,6 +109,78 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = not IS_DEV_ENV
 
+# --- Known-device cookie (account-lockout DoS mitigation) --------------------------
+#
+# Account lockout (see FAILED_LOGIN_LIMIT / lockout_hours below) locks the *account
+# row*, not the source IP: anyone who knows a victim's phone/email/username can burn
+# their guess budget and lock them out for `lockout_hours`, with no password needed.
+# That is the correct trade-off against offline brute-forcing, but taken alone it is
+# itself an unauthenticated, targeted denial-of-service.
+#
+# The mitigation (OWASP's standard "remember this device" pattern): on every
+# successful login we mint a long-lived, signed, HttpOnly cookie naming the exact
+# account that just logged in. A request that presents a *valid, matching* cookie for
+# the account it is trying to log into may bypass an active lock with the correct
+# password. A request with no cookie, or a cookie for a *different* account, gets
+# today's exact original behaviour — a locked account rejects even a correct password
+# for the full lockout window, and does not run check_password_hash() at all in that
+# case (see the comments in user_login() / _perform_admin_login() for why that
+# matters for timing).
+#
+# This is deliberately stateless — no new table/column/migration. It reuses the same
+# signing key and library (itsdangerous) that already backs Flask's session cookie,
+# per itsdangerous's own URLSafeTimedSerializer, not a new crypto primitive. A
+# distinct `salt` keeps it cryptographically separate from the session cookie and
+# from Flask's own internal use of app.secret_key, so neither can be replayed as the
+# other.
+#
+# Threat model — what a stolen/replayed device cookie buys an attacker: it does NOT
+# contain or derive the password, and it does NOT exempt the request from the
+# existing per-IP @rate_limit (10 requests/300s) already applied to both login
+# routes. A wrong guess presented alongside a valid device cookie is still rejected
+# outright while the account is locked (see below) — it is not treated as a fresh
+# unlimited guessing budget, only as "this request came from a browser this account
+# has used before". So the worst case a stolen cookie enables is: an attacker who (a)
+# already has the correct password (in which case the account is already fully
+# compromised regardless of this cookie) or (b) can still only guess up to `limit`
+# wrong passwords per lock window, the same as anyone else, just without triggering a
+# *new* lock on top of one already in effect. Exfiltrating an HttpOnly cookie in the
+# first place requires a materially larger compromise (device malware, physical
+# access, or a server-side compromise that can read Set-Cookie headers/logs) than a
+# remote credential-guessing attacker has — that bar is not lowered by this change.
+DEVICE_COOKIE_NAME = "sentinel_device"
+DEVICE_COOKIE_MAX_AGE_DAYS = int(os.getenv("DEVICE_COOKIE_MAX_AGE_DAYS", "180"))
+_device_cookie_signer = URLSafeTimedSerializer(app.secret_key, salt="sentinel-known-device-v1")
+
+
+def _issue_device_cookie(response, account_type: str, account_id) -> None:
+    """Mint/refresh the known-device cookie for (account_type, account_id) onto
+    `response`. Call this only after a fully successful login (post-2FA)."""
+    token = _device_cookie_signer.dumps({"t": account_type, "id": account_id})
+    response.set_cookie(
+        DEVICE_COOKIE_NAME,
+        token,
+        max_age=DEVICE_COOKIE_MAX_AGE_DAYS * 86400,
+        httponly=True,
+        secure=app.config["SESSION_COOKIE_SECURE"],
+        samesite="Lax",
+    )
+
+
+def _is_known_device(account_type: str, account_id) -> bool:
+    """True iff the incoming request carries a device cookie that is validly signed,
+    unexpired, and names this exact (account_type, account_id) — never any other
+    account. Per-account scoping is what stops a device cookie recognised for one
+    account from being used to bypass a lock on a different one."""
+    raw = request.cookies.get(DEVICE_COOKIE_NAME)
+    if not raw:
+        return False
+    try:
+        data = _device_cookie_signer.loads(raw, max_age=DEVICE_COOKIE_MAX_AGE_DAYS * 86400)
+    except (BadSignature, SignatureExpired):
+        return False
+    return data.get("t") == account_type and data.get("id") == account_id
+
 # X-Forwarded-For is client-supplied and must never be trusted blindly — an attacker
 # who can set it defeats the login rate limit, the lockout counter and the IP recorded
 # in activity_log. Only honour as many hops as we actually run behind.
@@ -129,13 +203,77 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_EXT = {"png", "jpg", "jpeg", "pdf"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
 
+# Hard ceiling on any request body Flask will buffer into memory before a single line
+# of handler code runs. Without this, Werkzeug reads the *entire* body up front the
+# moment a view touches request.form/request.files/request.get_data() — MAX_FILE_SIZE
+# above is enforced only *after* that read (see lea_register()), so it caps disk usage,
+# not memory. Under gunicorn --workers 1 (pinned deliberately — see the Dockerfile),
+# one oversized request is enough to exhaust that single worker's memory and take the
+# whole app down, and lea_register() (gov-ID upload) is reachable by any freshly
+# self-registered account, not just an admin — this is a same-tier fix to that gap,
+# not a redundant one.
+#
+# Sized at 20MB to match, not undercut or overshoot, two independent constraints that
+# happen to land on the same number:
+#   - deploy/nginx.conf / nginx.docker.conf already set `client_max_body_size 20m`,
+#     sized there for "two uploads up to 5MB each + form/multipart overhead" — i.e.
+#     lea_register()'s gov_id + dept_id pair. A Flask-level cap below the proxy's
+#     would never actually fire (nginx rejects first, with its own generic HTML error);
+#     above it would leave Flask doing full-body buffering nginx already promised not
+#     to forward — so this must equal the proxy cap, not merely be close to it.
+#   - it is also the documented real ceiling of the CSV/XLSX admin import wizard today
+#     (plans/DATA_POPULATION_PLAN.md: "the only loader is a 20MB-capped HTTP admin
+#     form", covering import_preview_v2/import_execute_v2/admin_data_upload/
+#     admin_data_preview). A genuine bulk-import path (hundreds of GB, tracked
+#     separately in that plan and in tools/bulk_import.py) does not go through this
+#     HTTP form at all, so it is not a reason to raise this cap.
+# One global number therefore serves both call sites without a per-route split:
+# lea_register() needs ~10-12MB and the import wizard already lives within nginx's
+# 20MB today, so nothing legitimate is left over-permissive by using the larger of
+# the two everywhere, and nothing legitimate needs more than the smaller of the two
+# provides elsewhere.
+MAX_CONTENT_LENGTH_MB = int(os.getenv("MAX_CONTENT_LENGTH_MB", "20"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
+
 # Upper bound on a single /api/events SSE connection's lifetime — see event_stream().
 EVENT_STREAM_MAX_SECONDS = 600
 
+# DB_HOST / DB_NAME keep their defaults even outside dev: both are pinned
+# authoritatively by docker-compose.yml (DB_HOST=mysql, DB_NAME=sentinel_db — see
+# deploy/docker-compose.yml's `app.environment` block, which overrides anything in
+# app.env), so a default here only ever matters for local dev, never for a real
+# deployment, and there is no dangerous *value* a host/db-name default could produce.
+#
+# DB_USER / DB_PASSWORD are different: "root" with no password is a plausible-looking
+# *real* local MySQL account, not an obviously-broken placeholder — so a missing or
+# typo'd env var here would not fail loudly. It would either connect to the wrong
+# database silently, or boot looking healthy (passing the container healthcheck, which
+# never touches the DB) and 500 only on the first request that does. Same class of bug
+# as the SECRET_KEY/ENCRYPTION_KEY fallbacks above, so it gets the same fail-fast
+# treatment.
+_db_user = os.getenv("DB_USER")
+_db_password = os.getenv("DB_PASSWORD")
+_missing_db_vars = [name for name, val in (("DB_USER", _db_user), ("DB_PASSWORD", _db_password)) if not val]
+if _missing_db_vars:
+    if not IS_DEV_ENV:
+        raise RuntimeError(
+            f"{' and '.join(_missing_db_vars)} not set. Refusing to start outside "
+            "FLASK_ENV=development — the defaults (root user, empty password) are a "
+            "plausible-looking real local MySQL account, so leaving them in would let "
+            "a missing or typo'd credential connect to the wrong database instead of "
+            "failing, or pass the healthcheck and 500 on the first request that touches "
+            "the database. Set DB_USER and DB_PASSWORD in .env."
+        )
+    _db_user = _db_user or "root"
+    _db_password = _db_password or ""
+    print(f"WARNING: {' and '.join(_missing_db_vars)} not set — using an insecure "
+          "development-only default (root / empty password) (allowed because "
+          "FLASK_ENV=development). Do not deploy like this.")
+
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", ""),
+    "user": _db_user,
+    "password": _db_password,
     "database": os.getenv("DB_NAME", "sentinel_db"),
 }
 
@@ -359,6 +497,201 @@ def _new_csrf_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+# ─────────────────────────────────────────────
+# INACTIVITY (IDLE) TIMEOUT — enforced server-side
+#
+# session_info() (below) only ever *reported* inactivity_timeout_seconds to the
+# client; nothing enforced it. Enforcement lived entirely in the JS timers in
+# dashboard.html/admin.html, so a stolen session cookie replayed directly
+# (curl, no JS) ignored the advertised idle window completely. The only real
+# server-side limit was Flask's *absolute* app.permanent_session_lifetime
+# (itsdangerous max_age on the signed cookie, default 60 min) — a much wider
+# window than the ~15 min idle timeout the product advertises, and a cap, not
+# an idle check. That absolute bound is untouched and stays the outer limit;
+# this is the tighter, inner one.
+#
+# Single source of truth: the exact same get_setting()/env-var lookup
+# session_info() already uses for inactivity_timeout_min. Not re-derived or
+# hardcoded a second time here.
+#
+# THE POLLING TRAP (the part of this fix most likely to be silently wrong):
+# dashboard.html and admin.html poll several read-only endpoints on timers
+# that have nothing to do with whether a human is present — /api/user/session
+# (60s setInterval), /api/admin/session-info (fetched once on page load as a
+# login probe), and /api/events, a Server-Sent-Events stream that itself
+# pushes a content-free sync ping every 5 seconds for as long as the
+# connection stays open and drives further background GETs from its
+# onmessage handlers (dashboard/catalog, intelligence/summary, and — while an
+# admin has that tab focused — health/services/integrations). If any of those
+# counted as "activity", an open-but-abandoned browser tab (or a stolen
+# cookie replayed by a script that just re-opens the SSE stream) would keep
+# refreshing the marker forever and the idle timeout could never fire in
+# production — while still looking correct in any test that doesn't leave a
+# tab open for 15 minutes.
+#
+# The fix: only state-changing requests count as activity. CSRF_SAFE_METHODS
+# (GET/HEAD/OPTIONS, defined above) is already this codebase's line for
+# "cannot mutate anything" — every poll/heartbeat endpoint named above is a
+# GET, and every action that actually means someone is at the keyboard
+# (running a lookup, saving settings, submitting LEA verification, changing a
+# password, approving a user, logging in) is a POST/PUT/DELETE. Reusing that
+# boundary means any *future* read-only polling endpoint is automatically
+# excluded too, with nothing new to maintain here. The trade-off: an admin who
+# spends 20 minutes purely reading (paging through a log, studying a report)
+# without a single write gets logged out anyway. That's the deliberately safe
+# failure direction — a false "you were idle" costs a re-login; the bug this
+# closes let a truly idle, stolen session stay live for up to an hour.
+#
+# Expiry is still *checked* (not just refreshed) on every authenticated
+# request, GET included — an idle-expired session is rejected on /api/events
+# too, opening that stream just never resets its own clock.
+#
+# last_activity_at lives in the signed session cookie, next to login_at /
+# user_login_at. Flask's SecureCookieSessionInterface verifies the itsdangerous
+# HMAC signature on the whole cookie before a view (or this hook) ever sees
+# its contents — the cookie is signed, not encrypted, so an attacker holding a
+# stolen one can *read* last_activity_at, but cannot move it forward (or
+# strip it) without invalidating the signature over the entire cookie, since
+# they do not have SECRET_KEY. Attacker-visible, not attacker-forgeable — same
+# trust model as every other field already carried in this session.
+# ─────────────────────────────────────────────
+def _inactivity_timeout_seconds() -> int:
+    """Idle-timeout window, in seconds — same setting session_info() reports."""
+    return int(get_setting("inactivity_timeout_min", os.getenv("INACTIVITY_TIMEOUT_MIN", "15"))) * 60
+
+
+# Endpoints this hook must not intercept, even when the session it finds is
+# stale. This was the missing piece: unlike _enforce_csrf() below, this hook
+# had no exemption concept at all, so a stale-but-still-"is_user"/"is_admin"
+# session cookie 401'd the *very next request to any route* — including
+# POST /api/user/login with the right password (never even inspected), GET
+# /api/admin/auth/google/login (a raw 401 instead of the 302 to Google), and
+# plain GET /login (401 JSON instead of the login page). It self-heals one
+# request later (session.clear() above forces a fresh cookie), but "reload
+# once more" is a bad answer for the two routes this hits hardest: an idle
+# admin clicking "Sign in with Google", and someone using password login as
+# the break-glass path when Google itself is the thing that's broken.
+#
+# This is a *different* list from CSRF_EXEMPT_ENDPOINTS, not an alias for it,
+# because the two hooks are exempting requests for different reasons:
+#
+#   - CSRF_EXEMPT_ENDPOINTS only has to cover unsafe methods (its own hook
+#     already returns early on every GET/HEAD/OPTIONS, see below) and only
+#     has to cover the handful of POSTs that mint a session rather than act
+#     on one — there is nothing yet to forge on those.
+#   - This hook runs on every method, GET included, and gates on
+#     is_user/is_admin alone with no "nothing to protect yet" shortcut of
+#     its own — a stale session is exactly what it exists to catch. So its
+#     exemption list has to be broader: every route a browser must still be
+#     able to reach — to view a login form, submit one, complete an OAuth
+#     round-trip, or just load the page's CSS — without an old, unrelated
+#     session cookie turning a plain page load into a raw 401.
+#
+# Concretely: the same five session-minting POSTs CSRF already exempts,
+# PLUS:
+#   - admin_google_login / admin_google_callback — the GET halves of the
+#     same OAuth round-trip CSRF exempts admin_login for. A stale session
+#     must not turn "click Sign in with Google" into a 401 instead of a 302
+#     to Google's consent screen, or turn Google's own callback redirect
+#     into a 401 instead of completing login.
+#   - login_page / admin_page — the pages that host the forms above.
+#     Neither reads anything from the session to decide what to render
+#     (admin_page's template flags are pure env/config, not session state),
+#     so there is nothing an idle session protects here either, and
+#     admin_page doubles as the break-glass password-login door when Google
+#     itself is down — which must stay reachable precisely when something
+#     else already is.
+#   - "static" — Flask's built-in static-file endpoint (CSS/JS/favicon).
+#     Never gated on session state before this hook existed. Unlike the CSRF
+#     hook, this one runs on every method, not just unsafe ones, so without
+#     this entry a stale session cookie sitting in the browser would 401 the
+#     page's own stylesheet.
+#
+# Deliberately NOT here: /dashboard and every @user_required/@admin_required/
+# @session_required route (including /api/events). Those exist specifically
+# to show something only to a *valid* session, so an idle-expired one
+# reaching them must still be rejected — exempting them would let a stale
+# session render authenticated content, the exact bug this hook exists to
+# close.
+#
+# The remaining content-only pages that share this hook's same pre-existing
+# quirk (/, /register, /pricing, /reset-password, /analysis /cdr-analysis)
+# were checked individually rather than swept in wholesale, since "doesn't
+# require a session" and "safe to exempt" are not the same claim — a route
+# could still branch on session state to decide what to render even without
+# a hard gate. Each was confirmed to do neither:
+#   - home (/), register_page (/register), reset_password_page
+#     (/reset-password) — render a template with no arguments and no inline
+#     session read at all; index.html/register.html/reset_password.html
+#     carry no Jinja templating either, so there is nothing server-rendered
+#     that session state could affect.
+#   - pricing_page (/pricing) — same on the server side (no session read in
+#     the route, no Jinja in pricing.html). It does probe
+#     GET /api/user/session client-side via fetch() to decide whether to
+#     show "Sign in" or account state, but that is the browser calling an
+#     already-authenticated-gated endpoint after the page loads, not this
+#     route branching on session — a stale session there just gets that
+#     endpoint's own (correct) 401, unrelated to this hook.
+#   - cdr_analysis_page (/analysis and /cdr-analysis — both point at this
+#     one function, so exempting the endpoint name covers both paths) —
+#     verified this is the page *shell* only: no inline session check, no
+#     Jinja in cdr_analysis.html, and all actual CDR/IPDR data is fetched
+#     client-side from separate @user_required/@admin_required JSON
+#     endpoints, which remain gated and are not touched by this list. A
+#     stale session loading the shell just gets a blank workspace until it
+#     re-authenticates against those endpoints, same as an anonymous visitor.
+# All six were confirmed safe on that basis and added below.
+INACTIVITY_EXEMPT_ENDPOINTS = CSRF_EXEMPT_ENDPOINTS | frozenset({
+    "admin_google_login",
+    "admin_google_callback",
+    "login_page",
+    "admin_page",
+    "static",
+    "home",
+    "register_page",
+    "pricing_page",
+    "reset_password_page",
+    "cdr_analysis_page",
+})
+
+
+@app.before_request
+def _enforce_inactivity_timeout():
+    if request.endpoint in INACTIVITY_EXEMPT_ENDPOINTS:
+        return None  # session-establishing route — see INACTIVITY_EXEMPT_ENDPOINTS above
+    if not (session.get("is_user") or session.get("is_admin")):
+        return None  # anonymous — nothing to expire, and the usual @*_required decorators still gate the route
+
+    last_active = session.get("last_activity_at")
+    if last_active:
+        try:
+            elapsed = (datetime.utcnow() - datetime.fromisoformat(last_active)).total_seconds()
+        except (TypeError, ValueError):
+            # Unparsable marker (shouldn't happen against a signed cookie we wrote
+            # ourselves) — treat as fresh rather than fail closed on a decode error.
+            elapsed = 0
+        if elapsed > _inactivity_timeout_seconds():
+            # Same shape existing code already uses for "no valid session":
+            # an {"error": ...} JSON 401. The frontend's fetch wrappers only
+            # branch on r.ok, not on the message, but a specific reason here
+            # (rather than a generic "Authentication required") is what lets
+            # the UI eventually tell a stale-tab logout apart from one that
+            # never had a session at all.
+            session.clear()
+            return jsonify({"error": "Session expired due to inactivity"}), 401
+
+    # Only a state-changing request — see the module comment above — refreshes
+    # the marker. A pure GET/HEAD/OPTIONS never does, EXCEPT to seed a marker
+    # that doesn't exist yet (a session from before this feature shipped, or
+    # one that has only ever made read-only calls so far): without that seed
+    # such a session would carry no last_activity_at and never expire at all,
+    # which is the opposite failure from the one this fix exists to close.
+    if request.method not in CSRF_SAFE_METHODS or "last_activity_at" not in session:
+        session["last_activity_at"] = datetime.utcnow().isoformat()
+
+    return None
+
+
 @app.before_request
 def _enforce_csrf():
     if request.method in CSRF_SAFE_METHODS:
@@ -401,18 +734,53 @@ def csrf_token_endpoint():
 # ─────────────────────────────────────────────
 # SECURITY HEADERS
 #
-# No security headers were set anywhere before this. The CSP below allows
-# 'unsafe-inline' for scripts and styles because every template ships its CSS
-# and JS inline with no nonce plumbing — tightening that is a real frontend
-# change (adding a per-request nonce to every <script>/<style> tag across 9
-# templates), not a one-line header, so it is left as a follow-up rather than
-# attempted half-done here. img-src allows data: for the base64 2FA QR codes
-# generated in setup_2fa().
+# No security headers were set anywhere before this. The CSP below still
+# allows 'unsafe-inline' for both script-src and style-src — this was
+# surveyed again (2026-09-03) rather than assumed, and a nonce-based refactor
+# is NOT a one-line change here:
+#
+#   - 10 templates (admin, cdr_analysis, dashboard, error, index, login,
+#     pricing, register, reset_password, workspace) each ship at least one
+#     inline <script> block (error.html has none) and one inline <style>
+#     block. A nonce fixes exactly this case.
+#   - But across those same templates there are ~142 inline event-handler
+#     attributes (onclick= etc. — 89 in admin.html, 44 in dashboard.html
+#     alone) and ~182 inline style="..." attributes (60 in admin.html, 88 in
+#     dashboard.html, 21 in cdr_analysis.html). A nonce does nothing for
+#     either of these — the browser only honors a nonce on the <script>/
+#     <style> tag itself, never on an attribute. Removing 'unsafe-inline'
+#     without also eliminating every onclick=/style= attribute would silently
+#     break every button and most of the layout on the two heaviest, hardest-
+#     to-test pages (admin.html, dashboard.html) the moment it shipped.
+#   - This repo has no MySQL instance locally and no browser test harness, so
+#     that breakage could not be caught by `pytest` — it would only surface
+#     live, in the admin console, on the deployed platform. That risk is not
+#     worth taking to close a defense-in-depth gap (two admin-authenticated
+#     XSS holes CSP would not have blocked were already fixed at the
+#     template-escaping layer on 2026-09-02 — this header is a second layer,
+#     not the only one).
+#
+# So: tightened what was free (object-src 'none' below — nothing in any
+# template uses <object>/<embed>/<applet>, so this costs nothing and closes
+# same-origin plugin embedding of anything ever placed under /uploads).
+# script-src/style-src 'unsafe-inline' stay as a tracked, documented gap.
+# A real fix would need, all at once (not incrementally, since a half-nonced
+# template set has no CSP benefit): a per-request nonce generated alongside
+# the CSRF token and exposed to Jinja, every <script>/<style> tag in all 10
+# templates updated to carry nonce="{{ csp_nonce }}", all ~142 onclick=
+# (etc.) attributes rewritten as addEventListener bindings, all ~182 inline
+# style= attributes moved to CSS classes, and a real browser pass (manual or
+# Selenium/Playwright) against a live MySQL-backed instance to confirm the
+# admin console and dashboard still work — this pytest suite has no browser
+# and would not catch a silently-broken onclick handler either way.
+#
+# img-src allows data: for the base64 2FA QR codes generated in setup_2fa().
 # ─────────────────────────────────────────────
 _CSP_POLICY = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline'; "
     "style-src 'self' 'unsafe-inline'; "
+    "object-src 'none'; "
     "img-src 'self' data:; "
     "font-src 'self'; "
     "connect-src 'self'; "
@@ -807,6 +1175,18 @@ def handle_500(e):
     return render_template("error.html", code=500, message="Something went wrong on our end."), 500
 
 
+@app.errorhandler(413)
+def handle_413(e):
+    # Every route that can trip MAX_CONTENT_LENGTH is a fetch()-driven API call, not a
+    # page navigation — unlike 404/500 above, an HTML error.html page here is useless:
+    # the frontend does `await r.json().catch(()=>({}))` and reads `d.error` (see
+    # templates/admin.html's toastMsg() call sites), so Werkzeug's default HTML 413
+    # would silently become an empty {} and a generic "failed" toast with no reason.
+    return jsonify({
+        "error": f"Request too large. Maximum upload size is {MAX_CONTENT_LENGTH_MB}MB.",
+    }), 413
+
+
 # ─────────────────────────────────────────────
 # PUBLIC TILE CATALOGS
 # ─────────────────────────────────────────────
@@ -1148,6 +1528,38 @@ def user_signup():
     }), 201
 
 
+# ─────────────────────────────────────────────
+# LOGIN TIMING SIDE-CHANNEL (account enumeration via response latency)
+#
+# The user_login()/_perform_admin_login() "account not found" branches used to
+# return their 401 immediately, while a wrong-password guess against a real
+# account first ran check_password_hash(). That is deliberately expensive —
+# whatever algorithm this checkout's werkzeug (see requirements.txt) picks for
+# generate_password_hash()/check_password_hash() ("scrypt:32768:8:1" as pinned
+# here at werkzeug 3.1.6; older werkzeug defaulted to pbkdf2:sha256 instead —
+# check_password_hash reads the method off the hash string itself, so either
+# way this code does not need to know or care which). Measured directly
+# against this checkout's install: ~95ms per check_password_hash() call, comfortably
+# network-measurable. The two branches already return byte-identical bodies
+# (see the comment on the `if not user:` return below), but that timing gap
+# still lets an attacker tell "no such account" from "wrong password" apart
+# even though the JSON is the same, defeating the point of matching the bodies.
+#
+# Fix: run a check_password_hash() of the same cost on every "no such account"
+# path too, against a hash of a value nobody typed. The hash is generated ONCE
+# here, at import time, not per-request — generate_password_hash() costs the
+# same as a check, so doing it per-request would (a) reintroduce a slow path
+# with its own variance and (b) burn CPU pointlessly on a value that never
+# needs to change. What must run per-request is only the *verification*
+# (check_password_hash), which is exactly what a real lookup does too.
+#
+# This does NOT need to be constant across restarts or shared across workers —
+# every worker just needs *a* password hash of *some* value, so each computes
+# its own at startup. secrets.token_hex() (not a fixed literal) means a
+# worker's memory never holds a compile-time constant that looks like a "real"
+# secret.
+_DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_hex(32))
+
 
 def _is_admin_username(identifier):
     """True when the identifier names an active row in admin_users."""
@@ -1238,19 +1650,24 @@ def user_login():
 
     if not user:
         conn.close()
+        # Same body/status as a wrong-password rejection below (a distinguishable
+        # response would let an attacker enumerate which phone/email is registered),
+        # AND the same cost: run the same check_password_hash() verification a
+        # real lookup would, against a hash nobody's password matches, so the
+        # two branches also take the same wall-clock time. See
+        # _DUMMY_PASSWORD_HASH above user_login().
+        check_password_hash(_DUMMY_PASSWORD_HASH, password)
         log_activity(None, "failed_login", f"Unknown identifier attempted login from {ip}: {identifier[:32]}")
-        # Same status/message as a wrong-password rejection below — a distinguishable
-        # response here would let an attacker enumerate which phone/email is registered.
         return jsonify({"error": "Invalid credentials"}), 401
 
-    # Lockout check
+    # Lockout bookkeeping. NOTE: the lock is judged below only against a WRONG
+    # password (see the comment above the `if not password_ok:` branch) — an
+    # attacker who has locked this account cannot use that lock to keep the
+    # real owner out.
     limit = int(get_setting("user_failed_login_limit", os.getenv("FAILED_LOGIN_LIMIT", "5")))
     lockout_hours = int(get_setting("lockout_hours", os.getenv("LOCKOUT_HOURS", "2")))
     locked_until = mysql_dt_to_aware(user.get("locked_until"))
-    if locked_until and locked_until > now_utc():
-        remaining = int((locked_until - now_utc()).total_seconds())
-        conn.close()
-        return jsonify({"error": "Account locked due to too many failed attempts.", "locked": True, "remaining_seconds": remaining}), 423
+    is_locked = bool(locked_until and locked_until > now_utc())
 
     # Unverified accounts may sign in — they just cannot query anything. Only an
     # explicitly disabled account is refused at the door.
@@ -1258,13 +1675,58 @@ def user_login():
         conn.close()
         return jsonify({"error": f"Account is {user.get('status')}. Contact the administrator."}), 403
 
+    # The lock exists to cap how many passwords someone who does NOT hold the
+    # real one gets to try against this account. Naively letting a *correct*
+    # password bypass an active lock unconditionally removes that cap entirely
+    # — every request still runs check_password_hash(), and a correct one
+    # always succeeds, so an attacker who has already burned the account's
+    # `limit` guesses could just keep guessing forever with no additional
+    # cost. The known-device cookie (see the module comment near
+    # app.secret_key) is what lets the *real* owner recover from a lock an
+    # attacker triggered, without reopening that door to the attacker too: a
+    # locked account only accepts a login at all if this request carries a
+    # valid device cookie naming this exact account, i.e. proof this browser
+    # has completed a full login here before. An attacker guessing over the
+    # network never has that cookie.
+    known_device = is_locked and _is_known_device("user", user["id"])
+
+    # No device cookie (the common case — this is what every attacker who has
+    # never logged in as this user hits): reject outright while locked,
+    # without even looking at the password. This is exactly the original,
+    # pre-known-device-cookie behaviour — check_password_hash() is not called,
+    # so there is no timing difference here from before this mitigation
+    # existed.
+    if is_locked and not known_device:
+        remaining = int((locked_until - now_utc()).total_seconds())
+        conn.close()
+        return jsonify({"error": "Account locked due to too many failed attempts.", "locked": True, "remaining_seconds": remaining}), 423
+
     stored_hash = user.get("password_hash")
 
     # No usable credential means fail closed. There is no fallback password: an
     # account with no hash is one an admin must issue a reset token for.
+    #
+    # NOTE for whoever picks up the login-timing side-channel item: reaching
+    # this line while `is_locked` is True means `known_device` was True (the
+    # branch above already returned otherwise) — so check_password_hash() now
+    # runs for a locked account in exactly one case: a request presenting a
+    # valid cookie for this account. That is a small, deliberate timing
+    # difference from the original code for that one case only; every other
+    # path (no cookie, or a cookie for a different account) is unchanged.
     password_ok = bool(stored_hash) and check_password_hash(stored_hash, password)
 
     if not password_ok:
+        if is_locked:
+            # Known device, but still the wrong password. This must NOT grant
+            # extra guesses beyond `limit` — a stolen/replayed device cookie is
+            # not a fresh guessing budget, only "this browser has logged in as
+            # this account before". So it is rejected outright, exactly like
+            # the no-cookie case, and does not increment failed_login_count
+            # (the account is already at or past its lock threshold).
+            remaining = int((locked_until - now_utc()).total_seconds())
+            conn.close()
+            return jsonify({"error": "Account locked due to too many failed attempts.", "locked": True, "remaining_seconds": remaining}), 423
+
         failed_count = int(user.get("failed_login_count") or 0) + 1
         try:
             if failed_count >= limit:
@@ -1283,6 +1745,16 @@ def user_login():
         conn.close()
         log_activity(user["id"], "failed_login", f"Failed login for {identifier} from {ip} ({failed_count}/{limit})", actor_type="user")
         return jsonify({"error": "Invalid credentials"}), 401
+
+    if is_locked:
+        # Correct password + a recognised device while locked (known_device is
+        # implied True here — see above). Let it through and note it in the
+        # audit trail, since "an account unlocked itself early via a
+        # recognised device" is exactly the kind of event worth being able to
+        # find later.
+        log_activity(user["id"], "user_lockout_bypassed_with_known_device",
+                     f"{identifier} logged in with the correct password from a recognised device while locked out from {ip}; login allowed, lock will clear",
+                     actor_type="user")
 
     if user.get("twofa_enabled"):
         otp = (data.get("otp") or "").strip()
@@ -1323,7 +1795,7 @@ def user_login():
 
     log_activity(user["id"], "user_login", f"{user.get('name') or identifier} logged in from {ip}", actor_type="user")
 
-    return jsonify({
+    resp = jsonify({
         "success": True,
         "csrf_token": session["csrf_token"],
         "redirect": "/dashboard",
@@ -1338,6 +1810,11 @@ def user_login():
             "verification_status": user.get("verification_status") or "unverified",
         },
     })
+    # Mint/refresh the known-device cookie on every fully successful login —
+    # this is what lets this browser recover from a future lock on this
+    # account. See the module comment near app.secret_key.
+    _issue_device_cookie(resp, "user", user["id"])
+    return resp
 
 
 @app.route("/api/user/logout", methods=["POST"])
@@ -1479,6 +1956,22 @@ def _establish_admin_session(admin, method="password"):
     session["login_at"] = datetime.utcnow().isoformat()
     session["csrf_token"] = _new_csrf_token()
     log_activity(admin["id"], "login", f"{admin['name']} logged in from {_client_ip()} via {method}")
+
+    # Mint/refresh the known-device cookie on every fully successful admin
+    # session, password or Google alike — see the module comment near
+    # app.secret_key. This function returns a plain dict, not a Response, and
+    # its two callers build the eventual response differently
+    # (_perform_admin_login feeds it into jsonify(payload), status;
+    # admin_google_callback discards the return value in favour of a
+    # redirect()) — after_this_request runs against whichever Response Flask
+    # ends up sending, regardless of which caller it was.
+    admin_id = admin["id"]
+
+    @after_this_request
+    def _mint_admin_device_cookie(response):
+        _issue_device_cookie(response, "admin", admin_id)
+        return response
+
     return {
         "success": True,
         "name": admin["name"],
@@ -1506,17 +1999,58 @@ def _perform_admin_login(username, password, otp="", recovery_code=""):
 
     if not admin:
         conn.close()
+        # Same body/status as a wrong-password rejection below, and the same cost:
+        # run the same check_password_hash() verification a real lookup would,
+        # against a hash nobody's password matches, so this branch takes the
+        # same wall-clock time as the "found, wrong password" branch. See
+        # _DUMMY_PASSWORD_HASH near user_login() — this is the login-timing
+        # side-channel fix, not dead code.
+        check_password_hash(_DUMMY_PASSWORD_HASH, password)
         log_activity(None, "failed_login", f"Failed login attempt for unknown username: {username}")
         return generic_error, 401
 
     locked_until = mysql_dt_to_aware(admin.get("locked_until"))
-    if locked_until and locked_until > now_utc():
+    is_locked = bool(locked_until and locked_until > now_utc())
+
+    # See the matching comment in user_login() and the module comment near
+    # app.secret_key: the lock caps how many wrong passwords get tried against
+    # this account. Letting a correct password bypass an active lock
+    # unconditionally would remove that cap — check_password_hash() still runs
+    # on every attempt and a correct one still succeeds, so an attacker who
+    # already burned `limit` guesses could just keep guessing. A locked
+    # account only accepts a login at all when this request carries a valid
+    # known-device cookie for this exact admin account, i.e. proof this
+    # browser has completed a full login here before; an attacker guessing
+    # over the network never has that cookie.
+    known_device = is_locked and _is_known_device("admin", admin["id"])
+
+    # No device cookie: reject outright while locked, without even looking at
+    # the password. This is the original, pre-known-device-cookie behaviour —
+    # check_password_hash() is not called, so there is no timing difference
+    # here from before this mitigation existed.
+    if is_locked and not known_device:
         remaining = int((locked_until - now_utc()).total_seconds())
         conn.close()
         log_activity(admin["id"], "locked_login_attempt", f"Locked account login blocked for {username}")
         return {"error": "Account locked", "locked": True, "remaining_seconds": remaining}, 423
 
+    # NOTE for the login-timing side-channel item: reaching this line while
+    # `is_locked` is True means `known_device` was True (the branch above
+    # already returned otherwise) — so check_password_hash() now runs for a
+    # locked admin account in exactly one case: a request presenting a valid
+    # cookie for this account. Same small, deliberate exception as in
+    # user_login().
     if not check_password_hash(admin["password_hash"], password):
+        if is_locked:
+            # Known device, but still the wrong password — rejected outright
+            # like the no-cookie case, and not counted as a further failed
+            # attempt. A stolen/replayed device cookie is not a fresh
+            # guessing budget, only "this browser has logged in before".
+            remaining = int((locked_until - now_utc()).total_seconds())
+            conn.close()
+            log_activity(admin["id"], "locked_login_attempt", f"Locked account login blocked for {username}")
+            return {"error": "Account locked", "locked": True, "remaining_seconds": remaining}, 423
+
         failed_count = int(admin.get("failed_login_count") or 0) + 1
         if failed_count >= limit:
             cursor.execute(
@@ -1532,6 +2066,14 @@ def _perform_admin_login(username, password, otp="", recovery_code=""):
         conn.close()
         log_activity(admin["id"], "failed_login", f"Failed login attempt for {username} ({failed_count}/{limit})")
         return generic_error, 401
+
+    if is_locked:
+        # Correct password + a recognised device during an active lockout —
+        # let it through (see above) and record it, since an early unlock via
+        # a recognised device is worth being able to find in the audit trail
+        # later.
+        log_activity(admin["id"], "admin_lockout_bypassed_with_known_device",
+                     f"{username} logged in with the correct password from a recognised device while locked out; login allowed, lock will clear")
 
     if admin.get("twofa_enabled"):
         verified = False
@@ -2668,6 +3210,31 @@ class InsufficientCredits(Exception):
         self.required = required
 
 
+def normalize_mobile_number(raw):
+    """Canonicalise an Indian mobile number to bare 10 digits.
+
+    Returns `(canonical, candidates)`. `canonical` is None when the input cannot
+    be a valid Indian mobile number at all — callers must treat that as a
+    malformed query (400), never as a miss (404). Returning the same 404 for
+    "not in the database" and "you typed it wrong" is the actual defect this
+    exists to fix: an investigator cannot act on evidence they can't tell apart.
+
+    `candidates` lists the forms the same subscriber may already be stored under
+    from a past import (bare, 91-, +91-, 0-prefixed), so a format mismatch
+    between the query and the stored row is not a false miss. Every candidate is
+    an exact value for an indexed column, so the lookup stays a point probe
+    rather than becoming a scan — see DOCKER_DEPLOY.md on the buffer pool.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) != 10 or digits[0] not in "6789":
+        return None, []
+    return digits, [digits, "91" + digits, "+91" + digits, "0" + digits]
+
+
 def lookup_cost(service) -> int:
     """Credits a single run of this service costs. Admin-editable per service."""
     if not service:
@@ -2740,7 +3307,27 @@ def run_tool_generic():
     # 1) Native database lookup tools — no API dependency required.
     try:
         if code == "mobile_lookup":
-            cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query,))
+            # Normalise before anything is searched, charged or logged. A
+            # malformed number is rejected here with its own reason code so the
+            # officer can tell a typo from a genuine absence; `query` is then
+            # rebound to the canonical form, which is what gets sent to any
+            # external integration and what lands in search_logs.query_value —
+            # so the audit ledger records one stable form of the number, and
+            # mobile_lookup_report_pdf can find its way back to the record.
+            canonical, mobile_candidates = normalize_mobile_number(query)
+            if not canonical:
+                conn.close()
+                return jsonify({
+                    "error": "That is not a valid Indian mobile number. Enter 10 digits "
+                             "(optionally with a +91 or 0 prefix). Nothing was searched "
+                             "and no credits were charged.",
+                    "reason": "invalid_query",
+                }), 400
+            query = canonical
+            _ph = ",".join(["%s"] * len(mobile_candidates))
+            cursor.execute(
+                f"SELECT * FROM subscriber_records WHERE mobile_number IN ({_ph}) LIMIT 1",
+                tuple(mobile_candidates))
             row = cursor.fetchone()
             if row:
                 try:
@@ -2767,7 +3354,11 @@ def run_tool_generic():
             # could bill for — and print a PDF from — an unrelated record that merely
             # contained the digits somewhere in its JSON.
             try:
-                cursor.execute("SELECT * FROM master_data_records WHERE source_type IN (\'subscriber\',\'custom\') AND record_key=%s ORDER BY created_at DESC LIMIT 20", (query,))
+                _ph2 = ",".join(["%s"] * len(mobile_candidates))
+                cursor.execute(
+                    f"SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') "
+                    f"AND record_key IN ({_ph2}) ORDER BY created_at DESC LIMIT 20",
+                    tuple(mobile_candidates))
                 rows = cursor.fetchall()
                 if rows:
                     for r in rows:
@@ -3076,7 +3667,17 @@ def mobile_lookup_report_pdf(search_log_id):
         return jsonify({"error": "No successful search found for this record — nothing to report."}), 400
 
     query_value = log.get("query_value") or ""
-    cursor.execute("SELECT * FROM subscriber_records WHERE mobile_number=%s LIMIT 1", (query_value,))
+    # Searches run after the normalisation fix log the canonical 10-digit form,
+    # but rows written before it hold whatever the officer typed. Match on the
+    # same candidate set either way so an old report is still printable, and
+    # fall back to the literal logged value for anything that isn't a mobile
+    # number at all.
+    _canon, _cands = normalize_mobile_number(query_value)
+    lookup_keys = _cands or [query_value]
+    _ph = ",".join(["%s"] * len(lookup_keys))
+    cursor.execute(
+        f"SELECT * FROM subscriber_records WHERE mobile_number IN ({_ph}) LIMIT 1",
+        tuple(lookup_keys))
     record = cursor.fetchone()
     if not record:
         # Exact key only — same reasoning as the run_tool_generic() charging path
@@ -3093,8 +3694,9 @@ def mobile_lookup_report_pdf(search_log_id):
         # that table but 404-ing its PDF would bill for a report the caller
         # cannot then obtain.
         cursor.execute(
-            "SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') AND record_key=%s ORDER BY created_at DESC LIMIT 1",
-            (query_value,),
+            f"SELECT * FROM master_data_records WHERE source_type IN ('subscriber','custom') "
+            f"AND record_key IN ({_ph}) ORDER BY created_at DESC LIMIT 1",
+            tuple(lookup_keys),
         )
         fallback = cursor.fetchone()
         if fallback:
@@ -4635,4 +5237,29 @@ def admin_cancel_order(order_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # This block only runs via `python app.py` directly — the real deploy path
+    # (gunicorn, see wsgi.py and the Dockerfile CMD) imports `app` as a module and
+    # never reaches here, so this is dead code in production... except when a human
+    # runs `python app.py` on a server "just to check something." Werkzeug's
+    # interactive debugger (debug=True) is remote code execution for anyone who can
+    # reach it, and host="0.0.0.0" means that's anyone on the network, not just
+    # localhost.
+    #
+    # The SECRET_KEY / ENCRYPTION_KEY / DB_USER / DB_PASSWORD fail-fast checks above
+    # already catch most accidental production-like runs earlier, at import time —
+    # but only when one of those is actually missing. This is the backstop for the
+    # case where all of them are correctly set (a fully configured production host)
+    # and someone still reaches for `python app.py` instead of gunicorn: IS_DEV_ENV
+    # is the same FLASK_ENV-derived flag used for those checks, so this refuses to
+    # start the dev server on exactly the same "production-like unless explicitly
+    # opted into dev" basis, rather than inventing a second notion of dev-vs-prod.
+    if IS_DEV_ENV:
+        app.run(debug=True, host="0.0.0.0", port=5000)
+    else:
+        raise RuntimeError(
+            "Refusing to start Werkzeug's development server (debug=True, bound to "
+            "0.0.0.0) outside FLASK_ENV=development — its interactive debugger is "
+            "remote code execution for anyone who can reach it. Use gunicorn instead: "
+            "gunicorn wsgi:app (see wsgi.py and the Dockerfile CMD for the real flags). "
+            "If this genuinely is local development, set FLASK_ENV=development in .env."
+        )

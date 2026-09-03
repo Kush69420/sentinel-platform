@@ -31,8 +31,11 @@ class FakeCursor:
             row = self.db["search_logs"].get(log_id)
             self._result = [dict(row)] if row and row["user_id"] == user_id else []
 
-        elif q.startswith("SELECT * FROM subscriber_records WHERE mobile_number=%s"):
-            row = self.db["subscriber_records"].get(params[0])
+        elif q.startswith("SELECT * FROM subscriber_records WHERE mobile_number IN ("):
+            # The report path normalises the logged query_value and probes every
+            # stored format variant of the same number — match on any candidate.
+            row = next((self.db["subscriber_records"][k] for k in params
+                        if k in self.db["subscriber_records"]), None)
             self._result = [dict(row)] if row else []
 
         elif q.startswith("SELECT * FROM master_data_records"):
@@ -40,7 +43,7 @@ class FakeCursor:
             # and ORDER BY created_at DESC LIMIT 1, so a regression in either the
             # exact-match filter or the "most recent wins" ordering is caught here.
             rows = [r for r in self.db.get("master_data_records", [])
-                    if r["source_type"] in ("subscriber", "custom") and r["record_key"] == params[0]]
+                    if r["source_type"] in ("subscriber", "custom") and r["record_key"] in params]
             rows.sort(key=lambda r: r["created_at"])
             self._result = [dict(rows[-1])] if rows else []
 
@@ -86,7 +89,7 @@ def make_db():
             },
             2: {
                 "id": 2, "user_id": 1, "phone": "9999999999", "search_type": "mobile",
-                "query_value": "0000000000", "case_reference": None,
+                "query_value": "9999999999", "case_reference": None,
                 "credits_used": 0, "sources_queried": "No match",
                 "created_at": datetime(2026, 8, 10, 12, 5, 0),
             },

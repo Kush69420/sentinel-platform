@@ -62,8 +62,11 @@ class FakeCursor:
             )
             self.lastrowid = len(self.db["search_logs"])
 
-        elif q.startswith("SELECT * FROM subscriber_records WHERE mobile_number=%s"):
-            row = self.db["subscriber_records"].get(params[0])
+        elif q.startswith("SELECT * FROM subscriber_records WHERE mobile_number IN ("):
+            # mobile_lookup normalises the query and probes every stored format
+            # variant of the same number, so match on any of the candidates.
+            row = next((self.db["subscriber_records"][k] for k in params
+                        if k in self.db["subscriber_records"]), None)
             self._result = [dict(row)] if row else []
 
         elif q.startswith("SELECT * FROM master_data_records"):
@@ -198,7 +201,7 @@ class MobileLookupCreditTests(unittest.TestCase):
         # Case (b): local miss + no integration configured at all. Behavior must
         # be byte-for-byte unchanged from before the fallthrough fix.
         self._login(user_id=1, phone="9999999999")
-        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000"}, headers=self.CSRF_HEADERS)
+        resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9999999999"}, headers=self.CSRF_HEADERS)
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(self.db["bot_users"][1]["credits"], 5)  # untouched
         self.assertEqual(self.db["credit_transactions"], [])
@@ -225,7 +228,7 @@ class MobileLookupCreditTests(unittest.TestCase):
         self._login(user_id=1, phone="9999999999")
         fake_twilio_response = {"phone_number": "+910000000000", "carrier": {"name": "Test Telecom"}}
         with mock.patch.object(self.app_module, "_http_json", return_value=fake_twilio_response) as mocked_http:
-            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000", "case_reference": "FIR-2026-9001"}, headers=self.CSRF_HEADERS)
+            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9999999999", "case_reference": "FIR-2026-9001"}, headers=self.CSRF_HEADERS)
             self.assertEqual(mocked_http.call_count, 1)
 
         self.assertEqual(resp.status_code, 200)
@@ -256,7 +259,7 @@ class MobileLookupCreditTests(unittest.TestCase):
         self._add_enabled_twilio_integration()
         self._login(user_id=1, phone="9999999999")
         with mock.patch.object(self.app_module, "_http_json", side_effect=Exception("provider timeout")):
-            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "0000000000"}, headers=self.CSRF_HEADERS)
+            resp = self.client.post("/api/tools/run", json={"code": "mobile_lookup", "query": "9999999999"}, headers=self.CSRF_HEADERS)
 
         # Same HTTP status as today's true-miss case — don't break the frontend.
         self.assertEqual(resp.status_code, 404)
@@ -277,7 +280,7 @@ class MobileLookupCreditTests(unittest.TestCase):
             # Drain after the pre-flight balance read but before the atomic debit,
             # which is exactly the window the `WHERE credits >= %s` guard exists to
             # cover. The subscriber lookup is the query that sits in that window.
-            if q.startswith("SELECT * FROM subscriber_records WHERE mobile_number=%s"):
+            if q.startswith("SELECT * FROM subscriber_records WHERE mobile_number IN ("):
                 self.db["bot_users"][1]["credits"] = 0  # a concurrent request drains it first
             return real_execute(cursor_self, query, params)
 
@@ -302,6 +305,74 @@ class MobileLookupCreditTests(unittest.TestCase):
         txns = resp.get_json()["transactions"]
         self.assertEqual(len(txns), 1)
         self.assertEqual(txns[0]["reason"], "service:mobile_lookup")
+
+
+class MobileNumberNormalizationTests(MobileLookupCreditTests):
+    """A format mismatch between what the officer types and what was imported
+    must not read as "not in the database", and a typo must not read as a miss.
+
+    Both used to return the same 404, which is the part that matters: the tool
+    produces evidence, and an investigator has to be able to tell "this number
+    has no subscriber record" from "I mistyped it". These tests pin the two
+    apart and pin the canonical form that lands in the audit ledger."""
+
+    def test_prefixed_and_spaced_forms_find_the_same_record(self):
+        for typed in ("+91 98765 43210", "+919876543210", "09876543210",
+                      "91-9876-543-210", "98765 43210"):
+            with self.subTest(typed=typed):
+                self.setUp()
+                self._login(user_id=1, phone="9999999999")
+                resp = self.client.post(
+                    "/api/tools/run",
+                    json={"code": "mobile_lookup", "query": typed},
+                    headers=self.CSRF_HEADERS)
+                self.assertEqual(resp.status_code, 200)
+                self.assertTrue(resp.get_json()["success"])
+
+    def test_audit_row_records_the_canonical_form_not_what_was_typed(self):
+        # The ledger has to hold one stable representation of the number, or
+        # "every search for 9876543210" misses the ones typed as +91....
+        self._login(user_id=1, phone="9999999999")
+        resp = self.client.post(
+            "/api/tools/run",
+            json={"code": "mobile_lookup", "query": "+91 98765 43210",
+                  "case_reference": "FIR-2026-2001"},
+            headers=self.CSRF_HEADERS)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["query"], "9876543210")
+        self.assertEqual(self.db["search_logs"][0]["query_value"], "9876543210")
+
+    def test_malformed_number_is_400_not_404_and_costs_nothing(self):
+        # An empty query is deliberately absent from this list: it is caught
+        # earlier by the generic "query required" guard, which is also a 400 but
+        # carries no reason code.
+        for typed in ("1234567890", "98765", "abcdefghij",
+                      "+1 202 555 0143", "98765432100"):
+            with self.subTest(typed=typed):
+                self.setUp()
+                self._login(user_id=1, phone="9999999999")
+                resp = self.client.post(
+                    "/api/tools/run",
+                    json={"code": "mobile_lookup", "query": typed},
+                    headers=self.CSRF_HEADERS)
+                # 400 with its own reason code — distinguishable by the client
+                # from the 404 a genuinely absent number returns.
+                self.assertIn(resp.status_code, (400,))
+                self.assertEqual(resp.get_json().get("reason"), "invalid_query")
+                # Nothing searched means nothing billed and nothing logged.
+                self.assertEqual(self.db["bot_users"][1]["credits"], 5)
+                self.assertEqual(self.db["credit_transactions"], [])
+                self.assertEqual(self.db["search_logs"], [])
+
+    def test_wellformed_absent_number_is_still_404(self):
+        # The other half of the pair: valid shape, simply not on file.
+        self._login(user_id=1, phone="9999999999")
+        resp = self.client.post(
+            "/api/tools/run",
+            json={"code": "mobile_lookup", "query": "9999999999"},
+            headers=self.CSRF_HEADERS)
+        self.assertEqual(resp.status_code, 404)
+        self.assertNotEqual(resp.get_json().get("reason"), "invalid_query")
 
 
 if __name__ == "__main__":

@@ -88,6 +88,20 @@ deployment that does not set the env vars below.
   of the platform at once — leave it unset/`0` in normal operation, flip it to
   `1` only to regain access, then set it back.
 
+**Live status (2026-09-02): rollout complete on the NAS — `/admin` is
+Google-only.** The browser flow was confirmed working end-to-end, then
+`ADMIN_PASSWORD_LOGIN` was set to `0` and the container recreated with
+`docker compose up -d app` (`restart` does not re-read `env_file`). Both
+`POST /api/admin/login` and the admin branch of `POST /api/user/login` now
+return 403 `"Password login is disabled. Sign in with Google."` The fallback
+password still exists in the database — only the door is shut — so break-glass
+is `ADMIN_PASSWORD_LOGIN=1` plus `docker compose up -d app`.
+
+Note when verifying: `curl /admin | grep -c loginPass` returns `1` even when
+password login is off, because the `doLogin()` JS helper is rendered
+unconditionally and self-guards on `document.getElementById('loginUser')`. Grep
+for `id="loginPass"` (the actual input) or assert the 403 on the two routes.
+
 **Redirect URI**: `GOOGLE_OAUTH_REDIRECT_URI` must be registered in Google
 Cloud Console → APIs & Services → Credentials, character-for-character, or
 Google refuses the callback with `redirect_uri_mismatch`. It must also be a

@@ -70,6 +70,13 @@ class SecurityHeadersTest(unittest.TestCase):
         resp = self.client.get("/")
         self.assertIn("frame-ancestors 'none'", resp.headers.get("Content-Security-Policy", ""))
 
+    def test_csp_forbids_plugin_content(self):
+        # Nothing in templates/ uses <object>/<embed>/<applet>, so this costs
+        # nothing and closes off same-origin plugin embedding of anything
+        # ever placed under /uploads (gov-ID uploads, etc.).
+        resp = self.client.get("/")
+        self.assertIn("object-src 'none'", resp.headers.get("Content-Security-Policy", ""))
+
     def test_hsts_absent_in_dev(self):
         resp = self.client.get("/")
         self.assertNotIn("Strict-Transport-Security", resp.headers)
