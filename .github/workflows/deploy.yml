@@ -1,0 +1,80 @@
+name: Deploy
+
+# Builds the app image, pushes it to ECR, and rolls it out to the EC2 host via SSM.
+# Does NOT run tests — that's test.yml's job. This workflow assumes main is green.
+#
+# Runs independently of test.yml rather than gating on it via workflow_run: a push to
+# main that fails tests is already a problem test.yml will flag on its own, and an ECR
+# push/deploy failure here is cheap to re-run — not worth the extra coupling/latency of
+# waiting on a separate workflow's run ID.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: 542489917608.dkr.ecr.ap-south-1.amazonaws.com/sentinel-app
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        run: echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: docker build -t "$ECR_REPOSITORY:${{ steps.vars.outputs.sha }}" -t "$ECR_REPOSITORY:latest" .
+
+      - name: Push image
+        run: |
+          docker push "$ECR_REPOSITORY:${{ steps.vars.outputs.sha }}"
+          docker push "$ECR_REPOSITORY:latest"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy via SSM
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:Name,Values=sentinel-app" \
+            --comment "Deploy sentinel-app:${IMAGE_TAG}" \
+            --parameters "{\"commands\":[\
+              \"aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPOSITORY}\",\
+              \"docker pull ${ECR_REPOSITORY}:${IMAGE_TAG}\",\
+              \"docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ECR_REPOSITORY}:latest\",\
+              \"docker compose -f /opt/sentinel/docker-compose.yml up -d app\"\
+            ]}" \
+            --query "Command.CommandId" --output text)
+          echo "SSM command: $COMMAND_ID"
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$(aws ssm list-command-invocations --command-id "$COMMAND_ID" --query 'CommandInvocations[0].InstanceId' --output text)" || true
+          aws ssm list-command-invocations --command-id "$COMMAND_ID" --details --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text
