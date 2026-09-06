@@ -163,7 +163,7 @@ def get_quota_status(cursor, year_month: str | None = None) -> dict:
     """
     year_month = year_month or _current_year_month()
     cursor.execute(
-        f"SELECT request_count FROM {_QUOTA_TABLE} WHERE year_month=%s",
+        f"SELECT request_count FROM {_QUOTA_TABLE} WHERE `year_month`=%s",
         (year_month,),
     )
     row = cursor.fetchone()
@@ -208,7 +208,7 @@ def _reserve_quota_slot(cursor, year_month: str) -> None:
     """
     cursor.execute(
         f"UPDATE {_QUOTA_TABLE} SET request_count = request_count + 1 "
-        "WHERE year_month=%s AND request_count < %s",
+        "WHERE `year_month`=%s AND request_count < %s",
         (year_month, MONTHLY_QUOTA_LIMIT),
     )
     if cursor.rowcount == 1:
@@ -219,12 +219,12 @@ def _reserve_quota_slot(cursor, year_month: str) -> None:
     # if it already exists for any reason (exhausted, or a concurrent
     # reservation just created it), so this can't clobber a real count.
     cursor.execute(
-        f"INSERT IGNORE INTO {_QUOTA_TABLE} (year_month, request_count) VALUES (%s, 0)",
+        f"INSERT IGNORE INTO {_QUOTA_TABLE} (`year_month`, request_count) VALUES (%s, 0)",
         (year_month,),
     )
     cursor.execute(
         f"UPDATE {_QUOTA_TABLE} SET request_count = request_count + 1 "
-        "WHERE year_month=%s AND request_count < %s",
+        "WHERE `year_month`=%s AND request_count < %s",
         (year_month, MONTHLY_QUOTA_LIMIT),
     )
     if cursor.rowcount == 1:

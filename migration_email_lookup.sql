@@ -39,12 +39,16 @@ CREATE TABLE IF NOT EXISTS email_gaia_cache (
 --   guard (see _reserve_quota_slot() in that module) BEFORE each SerpApi
 --   call is made, the same optimistic-concurrency idiom app.py's
 --   charge_for_lookup() uses for bot_users.credits.
+-- `year_month` is quoted throughout: YEAR_MONTH is a reserved MySQL keyword
+-- (the INTERVAL unit in expressions like INTERVAL '1-2' YEAR_MONTH), so the
+-- bare identifier is a syntax error on a real server — this only ever ran
+-- against mocked cursors in tests, never actual MySQL, until this fix.
 CREATE TABLE IF NOT EXISTS serpapi_usage_quota (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    year_month VARCHAR(7) NOT NULL UNIQUE, -- e.g. '2026-09'
+    `year_month` VARCHAR(7) NOT NULL UNIQUE, -- e.g. '2026-09'
     request_count INT NOT NULL DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_year_month (year_month)
+    INDEX idx_year_month (`year_month`)
 );
 
 -- ── Catalog flip: bring email_lookup out of "Coming Soon" ──

@@ -67,7 +67,7 @@ class _FakeCursor:
                 self.db["quota"][year_month] = {"request_count": 0}
             self.rowcount = 1
 
-        elif q.startswith("SELECT request_count FROM serpapi_usage_quota WHERE year_month=%s"):
+        elif q.startswith("SELECT request_count FROM serpapi_usage_quota WHERE `year_month`=%s"):
             (year_month,) = params
             row = self.db["quota"].get(year_month)
             self._result = {"request_count": row["request_count"]} if row else None
