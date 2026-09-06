@@ -82,19 +82,19 @@ def make_db():
     return {
         "search_logs": {
             1: {
-                "id": 1, "user_id": 1, "phone": "9999999999", "search_type": "mobile",
+                "id": 1, "user_id": 1, "phone": "9999999999", "search_type": "mobile_lookup",
                 "query_value": "9876543210", "case_reference": "FIR-2026-1182",
                 "credits_used": 2, "sources_queried": "Subscriber Database",
                 "created_at": datetime(2026, 8, 10, 12, 0, 0),
             },
             2: {
-                "id": 2, "user_id": 1, "phone": "9999999999", "search_type": "mobile",
+                "id": 2, "user_id": 1, "phone": "9999999999", "search_type": "mobile_lookup",
                 "query_value": "9999999999", "case_reference": None,
                 "credits_used": 0, "sources_queried": "No match",
                 "created_at": datetime(2026, 8, 10, 12, 5, 0),
             },
             3: {
-                "id": 3, "user_id": 1, "phone": "9999999999", "search_type": "mobile",
+                "id": 3, "user_id": 1, "phone": "9999999999", "search_type": "mobile_lookup",
                 # A match against a service the admin has marked free: credits_used=0
                 # but it was a real hit, not a miss (sources_queried != "No match").
                 "query_value": "9876543210", "case_reference": "FIR-2026-1183",

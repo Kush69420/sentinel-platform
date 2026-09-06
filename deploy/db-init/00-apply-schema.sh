@@ -53,4 +53,12 @@ run migration_google_admin_oauth.sql
 #   UPDATE services SET status='enabled' WHERE code='<code>';
 run migration_coming_soon.sql
 
+# Must run AFTER migration_coming_soon.sql, not before: that file
+# unconditionally marks every catalog service except mobile_lookup as
+# "upcoming", so if this ran first, migration_coming_soon.sql would
+# immediately re-mark email_lookup upcoming again, silently undoing the
+# catalog flip below. Adds the email_gaia_cache/serpapi_usage_quota tables
+# and flips services.status='enabled' for code='email_lookup'.
+run migration_email_lookup.sql
+
 echo "==> schema applied"

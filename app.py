@@ -17,11 +17,13 @@ import csv
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shlex
+import socket
 import subprocess
 import threading
 import time
@@ -32,9 +34,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+import sentinel_modules.gaia_resolver as gaia_resolver
+import sentinel_modules.google_osint as google_osint
+import sentinel_modules.serpapi_fallback as serpapi_fallback
+
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from xml.sax.saxutils import escape as xml_escape
+from xml.sax.saxutils import escape as xml_escape, quoteattr as xml_quoteattr
+from zoneinfo import ZoneInfo
 
 import mysql.connector
 import pyotp
@@ -48,7 +56,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from flask import (
     Flask,
     Response,
@@ -1192,7 +1200,7 @@ def handle_413(e):
 # ─────────────────────────────────────────────
 OSINT_TOOLS = [
     {"code": "mobile_lookup", "name": "Mobile Lookup", "icon": "📱", "category": "phone", "credits": 2, "status": "active", "description": "Lookup mobile number intelligence"},
-    {"code": "email_lookup", "name": "Email Lookup", "icon": "✉️", "category": "email", "credits": 2, "status": "upcoming", "description": "Lookup email intelligence"},
+    {"code": "email_lookup", "name": "Email Lookup", "icon": "✉️", "category": "email", "credits": 2, "status": "active", "description": "Lookup email intelligence"},
     {"code": "username_lookup", "name": "Username Lookup", "icon": "👤", "category": "identity", "credits": 2, "status": "upcoming", "description": "Search public username footprint"},
     {"code": "vehicle_lookup", "name": "Vehicle Lookup", "icon": "🚗", "category": "registry", "credits": 3, "status": "upcoming", "description": "Vehicle registration intelligence"},
     {"code": "ip_lookup", "name": "IP Lookup", "icon": "🌐", "category": "network", "credits": 2, "status": "upcoming", "description": "IP reputation and geo intel"},
@@ -3235,6 +3243,18 @@ def normalize_mobile_number(raw):
     return digits, [digits, "91" + digits, "+91" + digits, "0" + digits]
 
 
+_EMAIL_SHAPE_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_plausible_email(value: str) -> bool:
+    """Permissive email shape check for email_lookup — not RFC 5322
+    validation, just enough to reject an empty local part, a missing '@', a
+    domain with no '.', or embedded whitespace before anything is searched,
+    charged, or logged. `[^@\\s]` on both sides of the '@' also guarantees
+    there is exactly one '@' in the value."""
+    return bool(_EMAIL_SHAPE_RE.match((value or "").strip()))
+
+
 def lookup_cost(service) -> int:
     """Credits a single run of this service costs. Admin-editable per service."""
     if not service:
@@ -3430,6 +3450,150 @@ def run_tool_generic():
         conn.close()
         return jsonify({"error": f"Database lookup failed: {exc}"}), 500
 
+    # 1b) email_lookup — Google GAIA/Maps OSINT reimplementation. This is a
+    # sibling of section 1 above, not nested inside its try/except: this tool
+    # never touches `mysql.connector` locally (its own DB work goes through
+    # `sentinel_modules.gaia_resolver`/`serpapi_fallback`'s own fresh
+    # `db_conn()`), and it makes real external network calls (GAIA
+    # resolution, then a Maps scrape or SerpApi call), so it gets its own
+    # connection lifecycle and its own exception handling rather than being
+    # caught by the `mysql.connector.Error` handler above.
+    #
+    # `conn`/`cursor` from the top of this function are still open at this
+    # point (no branch above closes them for `code == "email_lookup"`) and
+    # were only used to load `service`/`user` and check affordability, so
+    # they are closed here — before any external call — and a fresh
+    # `db_conn()` is opened only for the final search_logs write, mirroring
+    # how mobile_lookup's own API-integration path (lines below) closes its
+    # connection before calling out and reopens one only to log/charge.
+    if code == "email_lookup":
+        email = query
+        if not is_plausible_email(email):
+            conn.close()
+            return jsonify({
+                "error": "That is not a valid email address. Enter a plain "
+                         "address like name@example.com. Nothing was "
+                         "searched and no credits were charged.",
+                "reason": "invalid_query",
+            }), 400
+
+        conn.close()
+
+        # Step 1: resolve the email to a Google GAIA id.
+        try:
+            gaia_result = gaia_resolver.resolve_gaia(email)
+        except gaia_resolver.GaiaResolverCredentialError as exc:
+            return jsonify({
+                "error": f"Email lookup is temporarily unavailable: {exc}",
+                "reason": "credential_error",
+            }), 502
+        except Exception:
+            # Anything else here is a bug, not an anticipated outcome — no
+            # log write (state unclear), just a clean 500.
+            return jsonify({
+                "error": "Email lookup failed due to an unexpected internal error.",
+                "reason": "internal_error",
+            }), 500
+
+        if not gaia_result:
+            # Working credential, no Google account for this address — a
+            # genuine, billable-as-a-miss search outcome (mirrors
+            # mobile_lookup's uncharged-but-logged "No match" pattern).
+            with db_conn() as log_conn:
+                log_cursor = log_conn.cursor(dictionary=True)
+                charge_for_lookup(log_cursor, user, service, code, email, case_reference,
+                                  found=False, source="No match")
+                log_conn.commit()
+            return jsonify({
+                "success": False,
+                "error": "No Google account found for this email address.",
+                "reason": "no_match",
+            }), 404
+
+        gaia_id = gaia_result["gaia_id"]
+
+        # Step 2: primary path — free, unauthenticated Google Maps scrape.
+        # Step 3: on GoogleOsintError, fall back to the paid, quota-capped
+        # SerpApi path. Only a genuine successful fetch from either path
+        # reaches the charge step below.
+        try:
+            profile = google_osint.fetch_profile_and_reviews(gaia_id)
+            source = "Google OSINT"
+        except google_osint.GoogleOsintError:
+            try:
+                profile = serpapi_fallback.fetch_profile_and_reviews_via_serpapi(gaia_id)
+                source = "SerpApi (fallback)"
+            except serpapi_fallback.SerpApiQuotaExceededError as exc:
+                with db_conn() as log_conn:
+                    log_cursor = log_conn.cursor(dictionary=True)
+                    charge_for_lookup(log_cursor, user, service, code, email, case_reference,
+                                      found=False, source="Lookup failed")
+                    log_conn.commit()
+                return jsonify({
+                    "error": f"Email lookup's fallback provider is unavailable this month: {exc}",
+                    "reason": "quota_exceeded",
+                }), 503
+            except serpapi_fallback.SerpApiError as exc:
+                with db_conn() as log_conn:
+                    log_cursor = log_conn.cursor(dictionary=True)
+                    charge_for_lookup(log_cursor, user, service, code, email, case_reference,
+                                      found=False, source="Lookup failed")
+                    log_conn.commit()
+                return jsonify({
+                    "error": f"Email lookup failed: {exc}",
+                    "reason": "lookup_failed",
+                }), 502
+            except Exception:
+                return jsonify({
+                    "error": "Email lookup failed due to an unexpected internal error.",
+                    "reason": "internal_error",
+                }), 500
+        except Exception:
+            return jsonify({
+                "error": "Email lookup failed due to an unexpected internal error.",
+                "reason": "internal_error",
+            }), 500
+
+        # Step 4: genuine success (primary or fallback) — charge and log.
+        # Reviews may carry tz-aware `datetime` objects (see
+        # google_osint.fetch_profile_and_reviews / serpapi_fallback's
+        # docstrings) which are not JSON-serializable as-is; convert each to
+        # its isoformat string without disturbing any other review field.
+        reviews = []
+        for review in (profile.get("reviews") or []):
+            review = dict(review)
+            review["date"] = review["date"].isoformat() if review.get("date") else None
+            reviews.append(review)
+        result_data = {
+            "display_name": profile.get("display_name"),
+            "photo_url": profile.get("photo_url"),
+            "total_reviews": profile.get("total_reviews"),
+            "reviews": reviews,
+        }
+
+        with db_conn() as log_conn:
+            log_cursor = log_conn.cursor(dictionary=True)
+            try:
+                charged, search_log_id = charge_for_lookup(
+                    log_cursor, user, service, code, email, case_reference,
+                    found=True, source=source)
+            except InsufficientCredits as exc:
+                log_conn.rollback()
+                return jsonify({
+                    "error": "Insufficient credits for this lookup.",
+                    "reason": "insufficient_credits",
+                    "credits_required": exc.required,
+                    "credits_available": credits_available,
+                }), 402
+            log_conn.commit()
+        return jsonify({
+            "success": True, "tool": code, "query": email,
+            "credits_charged": charged,
+            "credits_remaining": credits_available - charged,
+            "search_log_id": search_log_id,
+            "results": [{"source": source, "status": "ok", "data": result_data}],
+        })
+
     # 2) API based lookups — use enabled integration by category/API dependency.
     category = TOOL_CATEGORY_MAP.get(code) or (service.get("category") if service else "")
     api_dep = (service.get("api_dependency") if service else "") or ""
@@ -3460,6 +3624,10 @@ def run_tool_generic():
                 url = f"{base or 'https://lookups.twilio.com/v2'}/PhoneNumbers/{urllib.parse.quote(query)}"
                 resp = _http_json(url, None, {"Authorization": f"Basic {auth}"}, method="GET")
                 results.append({"source": integ["name"], "status": "ok", "data": resp})
+            # Unreachable for `email_lookup`: the GAIA/Maps reimplementation
+            # in section 1b above always returns before control reaches
+            # here for this code. Left in place for any other provider that
+            # might match `"hunter" in name` under a different tool code.
             elif "hunter" in name and code == "email_lookup":
                 url = f"{base or 'https://api.hunter.io/v2'}/email-verifier?email={urllib.parse.quote(query)}&api_key={urllib.parse.quote(key)}"
                 resp = _http_json(url, None, {}, method="GET")
@@ -3646,11 +3814,377 @@ def _build_mobile_lookup_pdf(log: dict, record: dict) -> bytes:
     return buf.getvalue()
 
 
+# ─────────────────────────────────────────────
+# EMAIL LOOKUP — PDF REPORT
+# ─────────────────────────────────────────────
+_IMAGE_FETCH_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+_IMAGE_FETCH_TIMEOUT_SECONDS = 8
+_EMAIL_REPORT_CONTENT_WIDTH = 178 * mm  # A4 (210mm) minus 16mm left/right margins
+
+
+def _fetch_remote_image_safe(url: str) -> bytes | None:
+    """SSRF-hardened fetch of a remote image (a Google profile photo URL)
+    for embedding in the email-lookup PDF report.
+
+    Every failure mode here — bad scheme, DNS resolution to a private/
+    internal address, oversized body, non-image content-type, timeout,
+    non-200 status, a redirect — returns ``None`` rather than raising. A
+    missing profile photo is not a report-generation failure; this
+    function is the only thing standing between an externally-supplied
+    photo URL and an attacker-controlled internal address, so nothing here
+    should be loosened without equal care:
+
+      1. https-only scheme, checked before any network call.
+      2. Every IP address the hostname resolves to (not just the literal
+         host string) is checked against ipaddress' private/internal
+         ranges via socket.getaddrinfo() — a hostname can resolve to a
+         private address even when the URL text "looks" like it points
+         somewhere public (DNS-rebinding-adjacent bypass).
+      3. Response body capped at 5 MB, read incrementally (chunked, same
+         chunk_size/total-byte-tracking shape as
+         sentinel_modules/serpapi_fallback.py's own capped GET) so an
+         oversized/streaming body can't exhaust memory before the cap is
+         enforced.
+      4. Content-Type must start with "image/".
+      5. Redirects are not followed (allow_redirects=False) — a redirect
+         target was never DNS-checked above, so chasing it would reopen
+         the same hole via a different hostname.
+      6. Short timeout so a slow/hanging host can't stall report
+         generation.
+
+    Kept as a standalone top-level function (not a nested closure) so it
+    can be imported and unit-tested directly — monkeypatching
+    socket.getaddrinfo() / requests.get() around it — without going
+    through a full PDF build.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(str(url or ""))
+    except Exception:
+        return None
+
+    if parsed.scheme != "https" or not parsed.hostname:
+        return None
+
+    hostname = parsed.hostname
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None
+
+    try:
+        addrinfo = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return None
+    if not addrinfo:
+        return None
+
+    for family, _stype, _proto, _canonname, sockaddr in addrinfo:
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return None
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return None
+
+    try:
+        resp = requests.get(
+            url,
+            timeout=_IMAGE_FETCH_TIMEOUT_SECONDS,
+            allow_redirects=False,
+            stream=True,
+        )
+    except Exception:
+        return None
+
+    try:
+        if resp.status_code != 200:
+            return None
+
+        content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not content_type.startswith("image/"):
+            return None
+
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _IMAGE_FETCH_MAX_BYTES:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except Exception:
+        return None
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def _format_ist_datetime(dt) -> str:
+    """Format a tz-aware datetime as IST (`Asia/Kolkata`) in the report's
+    `%d-%m-%Y %H:%M:%S` display style. Returns "Not available" for None or
+    anything that isn't actually a datetime — this must never raise, since
+    it runs directly inside PDF story construction."""
+    if not dt or not hasattr(dt, "astimezone"):
+        return "Not available"
+    try:
+        return dt.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y %H:%M:%S")
+    except Exception:
+        return "Not available"
+
+
+def _safe_https_link_markup(url, display_text: str) -> str:
+    """Build reportlab `<link href="...">` markup for an external URL, only
+    if the URL's scheme is exactly https (checked via urlsplit, not a
+    prefix/substring check, so "http://evil/?x=https://" can't slip
+    through). The display text is escaped with xml.sax.saxutils.escape(),
+    same as everywhere else in this file, since it lands in a text node.
+
+    The href is a different context: it lands inside Paragraph's XML-like
+    markup as a double-quoted *attribute value*, not a text node.
+    escape() only neutralises `&`/`<`/`>` — it deliberately does not escape
+    `"` (that's correct for text nodes, but wrong here), so a URL
+    containing a literal `"` (e.g. `maps_url`/a profile "reviews" link,
+    both partly built from externally-sourced Google/SerpApi review data —
+    see the module notes on that data being attacker-influenceable) could
+    close the attribute early and inject raw markup into reportlab's
+    parser. xml.sax.saxutils.quoteattr() is the correct primitive for an
+    attribute value: it escapes the same three characters *and* handles
+    quoting (picking a safe surrounding quote character, escaping embedded
+    quotes) so the value can never break out of the attribute.
+
+    Falls back to plain escaped display text (no link) if the URL isn't
+    https or is missing/malformed."""
+    safe_text = xml_escape(str(display_text))
+    try:
+        scheme_ok = bool(url) and urllib.parse.urlsplit(str(url)).scheme == "https"
+    except Exception:
+        scheme_ok = False
+    if not scheme_ok:
+        return safe_text
+    safe_href = xml_quoteattr(str(url))
+    return f'<link href={safe_href}><font color="#c0392b">{safe_text}</font></link>'
+
+
+def _scaled_report_image(image_bytes: bytes, max_dim_mm: float):
+    """Build a reportlab Image flowable from raw bytes, scaled down (aspect
+    preserved) to fit within a max_dim_mm x max_dim_mm box. Returns None on
+    any failure (corrupt/unreadable image bytes) rather than raising — a
+    photo that fails to decode here must degrade the same way a photo that
+    failed to fetch does: the report still builds, just without it."""
+    try:
+        from reportlab.lib.utils import ImageReader
+        reader = ImageReader(io.BytesIO(image_bytes))
+        iw, ih = reader.getSize()
+        if not iw or not ih:
+            return None
+        max_dim = max_dim_mm * mm
+        scale = min(max_dim / iw, max_dim / ih, 1.0)
+        return Image(io.BytesIO(image_bytes), width=iw * scale, height=ih * scale)
+    except Exception:
+        return None
+
+
+def _build_email_lookup_pdf(log: dict, profile: dict) -> bytes:
+    """Render a search_logs row + a fetched Google OSINT profile as a PDF
+    report, styled after a competitor report's structure/information
+    density (header band, chevron-marked section headers, repeating review
+    blocks) — SENTINEL's own report, SENTINEL's own configured app_name,
+    no third-party branding.
+
+    `log` is a search_logs row dict (query_value/id/case_reference used;
+    created_at is deliberately NOT used for "Date of Report" — see below).
+    `profile` mirrors sentinel_modules.google_osint.fetch_profile_and_reviews()'s
+    return shape (display_name/photo_url/total_reviews/reviews), optionally
+    carrying an additional "gaia_id" key set by the caller (neither the
+    live fetch functions nor the search_logs row carry a GAIA id anywhere
+    else, so callers that have one — having just resolved it to make this
+    fetch — pass it through this way; its absence degrades gracefully
+    rather than crashing report generation).
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=14 * mm, bottomMargin=16 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
+    styles = getSampleStyleSheet()
+
+    header_style = ParagraphStyle("SentinelEmailHeader", parent=styles["Title"], fontSize=16, leading=20, textColor=colors.white, alignment=1)
+    note_style = ParagraphStyle("SentinelEmailNote", parent=styles["Normal"], fontSize=8.5, leading=12, textColor=colors.HexColor("#0e1a29"))
+    section_style = ParagraphStyle("SentinelEmailSection", parent=styles["Heading2"], fontSize=11.5, leading=14, textColor=colors.HexColor("#0e1a29"), spaceBefore=10, spaceAfter=4)
+    field_style = ParagraphStyle("SentinelEmailField", parent=styles["Normal"], fontSize=9.5, leading=14, textColor=colors.HexColor("#222222"))
+    review_title_style = ParagraphStyle("SentinelEmailReviewTitle", parent=styles["Normal"], fontSize=10, leading=13, fontName="Helvetica-Bold", textColor=colors.HexColor("#0e1a29"), spaceBefore=8)
+    footer_style = ParagraphStyle("SentinelEmailFooter", parent=styles["Normal"], fontSize=7.5, leading=11, textColor=colors.HexColor("#777777"))
+
+    # All of these are user input (query_value/case_reference via
+    # search_logs), external API data (profile fields, review fields), or
+    # DB rows — reportlab's Paragraph parses mini XML-like markup, so every
+    # one of them must go through xml_escape() before interpolation, same
+    # Day-2 fix already applied in _build_mobile_lookup_pdf() above.
+    app_name = xml_escape(str(get_setting("app_name", "SENTINEL")))
+    confidentiality_note = xml_escape(str(get_setting(
+        "email_report_confidentiality_note",
+        "This report is strictly confidential and is intended solely for "
+        "authorized law-enforcement use. Do not share outside official channels.",
+    )))
+    legal_disclaimer = xml_escape(str(get_setting(
+        "email_report_legal_disclaimer",
+        "This report is generated for informational and investigative "
+        "purposes only, compiled from publicly accessible third-party "
+        "profile data. No guarantee is made as to the accuracy, "
+        "completeness, or currency of any information in this report. It "
+        "is the recipient's responsibility to independently verify its "
+        "contents and to ensure any use of this report complies with "
+        "applicable law and departmental policy before acting on it. The "
+        "creators and operators of this platform accept no liability for "
+        "any decision made or action taken on the basis of this report. "
+        "Recipients are advised to seek independent legal or professional "
+        "advice before relying on it.",
+    )))
+
+    email_value = xml_escape(str(log.get("query_value") or ""))
+    search_log_id = xml_escape(str(log.get("id") or ""))
+    case_reference = xml_escape(str(log.get("case_reference") or "—"))
+    report_date_str = _format_ist_datetime(datetime.now(ZoneInfo("Asia/Kolkata")))
+    officer_phone = xml_escape(str(session.get("user_phone") or "Not available"))
+
+    display_name = profile.get("display_name")
+    display_name_str = xml_escape(str(display_name)) if display_name else "Not available"
+    gaia_id = profile.get("gaia_id")
+    gaia_id_str = xml_escape(str(gaia_id)) if gaia_id else "Not available"
+
+    photo_url = profile.get("photo_url")
+    photo_bytes = _fetch_remote_image_safe(photo_url) if photo_url else None
+
+    story = []
+
+    # ---- Header band ----
+    header_table = Table([[Paragraph(f"{app_name} E-MAIL OSINT REPORT", header_style)]], colWidths=[_EMAIL_REPORT_CONTENT_WIDTH])
+    header_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0e1a29")),
+        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    story.append(header_table)
+    story.append(Spacer(1, 4 * mm))
+
+    # ---- Confidentiality note box ----
+    note_table = Table([[Paragraph(confidentiality_note, note_style)]], colWidths=[_EMAIL_REPORT_CONTENT_WIDTH])
+    note_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#dceefb")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(note_table)
+    story.append(Spacer(1, 5 * mm))
+
+    # ---- Subject Information ----
+    story.append(Paragraph("» SUBJECT INFORMATION", section_style))
+    story.append(Paragraph(
+        f"E-Mail Address : {email_value}<br/>"
+        f"Date of Report : {report_date_str}<br/>"
+        f"Report Generated by : {officer_phone}<br/>"
+        f"Search Log ID : {search_log_id}<br/>"
+        f"Case Reference : {case_reference}",
+        field_style,
+    ))
+
+    # ---- Names ----
+    story.append(Paragraph("» NAMES", section_style))
+    story.append(Paragraph(f"1. {display_name_str}", field_style))
+
+    # ---- Google Profile History ----
+    story.append(Paragraph("» GOOGLE PROFILE HISTORY", section_style))
+    profile_lines = f"Profile Name : {display_name_str}<br/>Profile ID : {gaia_id_str}<br/>"
+    if gaia_id:
+        reviews_url = "https://www.google.com/maps/contrib/" + urllib.parse.quote(str(gaia_id), safe="") + "/reviews/"
+        profile_lines += "Reviews : " + _safe_https_link_markup(reviews_url, "Click Here to View Reviews")
+    else:
+        profile_lines += "Reviews : Not available"
+    profile_para = Paragraph(profile_lines, field_style)
+
+    thumb = _scaled_report_image(photo_bytes, 28) if photo_bytes else None
+    if thumb is not None:
+        profile_table = Table([[profile_para, thumb]], colWidths=[130 * mm, 48 * mm])
+        profile_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ]))
+        story.append(profile_table)
+    else:
+        story.append(profile_para)
+
+    # ---- Google Reviews ----
+    story.append(Paragraph("» GOOGLE REVIEWS", section_style))
+    reviews = profile.get("reviews") or []
+    if not reviews:
+        story.append(Paragraph("No public reviews were found for this profile.", field_style))
+    for idx, review in enumerate(reviews, start=1):
+        business_name = review.get("business_name")
+        business_name_str = xml_escape(str(business_name)) if business_name else "Not available"
+        business_address = review.get("business_address")
+        business_address_str = xml_escape(str(business_address)) if business_address else "Not available"
+        comment = review.get("comment")
+        comment_str = xml_escape(str(comment)) if comment else "—"
+        maps_url = review.get("maps_url")
+        map_line = _safe_https_link_markup(maps_url, "Click Here to Open Google Map") if maps_url else "Not available"
+        review_date_str = _format_ist_datetime(review.get("date"))
+
+        story.append(Paragraph(f"Review#{idx}", review_title_style))
+        story.append(Paragraph(
+            f"{business_name_str}<br/>"
+            f"{business_address_str}<br/>"
+            f"Map Location : {map_line}<br/>"
+            f"Review Date : {review_date_str}<br/>"
+            f"Comment : {comment_str}",
+            field_style,
+        ))
+
+    # ---- Images ----
+    # Omitted entirely (no heading either) if no photo could be fetched —
+    # a missing image must never crash report generation or show a broken
+    # placeholder.
+    large_photo = _scaled_report_image(photo_bytes, 90) if photo_bytes else None
+    if large_photo is not None:
+        story.append(Paragraph("» IMAGES", section_style))
+        story.append(large_photo)
+
+    # ---- Legal Disclaimer ----
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph("» LEGAL DISCLAIMER", section_style))
+    story.append(Paragraph(legal_disclaimer, footer_style))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
 @app.route("/api/tools/run/report/pdf/<int:search_log_id>", methods=["GET"])
 @user_required
 def mobile_lookup_report_pdf(search_log_id):
-    """Re-format an already-paid-for mobile_lookup search as a PDF. No new credit charge,
-    no new search_logs row — this reads back a prior search, scoped to the caller."""
+    """Re-format an already-paid-for search as a PDF. No new credit charge,
+    no new search_logs row — this reads back a prior search, scoped to the
+    caller.
+
+    Dispatches on search_logs.search_type:
+      - "mobile_lookup" — unchanged logic below: reads back the stored
+        subscriber_records/master_data_records row.
+      - "email_lookup" — there is nothing persisted to read back (the
+        email_lookup branch of run_tool_generic() deliberately never
+        stores the fetched Google profile/reviews anywhere; only the
+        email -> gaia_id mapping is cached, inside gaia_resolver's own
+        table), so this re-runs the Step B fetch live instead, mirroring
+        run_tool_generic()'s primary/fallback chain. This is a reprint,
+        not a new search: no charge_for_lookup() call, no new search_logs
+        row.
+      - anything else — a clean 400, not a silent fall-through into
+        mobile_lookup logic against irrelevant data (the bug this dispatch
+        fixes: this route used to assume every search_logs row was a
+        mobile_lookup phone-number search regardless of what tool actually
+        produced it)."""
     user_id = session.get("user_id")
     conn = get_db()
     cursor = conn.cursor(dictionary=True)
@@ -3662,9 +4196,82 @@ def mobile_lookup_report_pdf(search_log_id):
     # credits_used is 0 both for a genuine miss and for a match against a
     # service the admin has marked free — sources_queried is the only field
     # that actually distinguishes "found nothing" from "found it, for free".
+    # Applies to every search_type: a "no match" row has nothing to report
+    # regardless of which tool produced it.
     if (log.get("sources_queried") or "").strip().lower() == "no match":
         conn.close()
         return jsonify({"error": "No successful search found for this record — nothing to report."}), 400
+
+    search_type = log.get("search_type")
+
+    if search_type == "email_lookup":
+        # No local DB work left to do — close the connection before the
+        # external network calls below, same as run_tool_generic()'s own
+        # email_lookup branch does ahead of its Step 1/Step 2 calls.
+        conn.close()
+        email = log.get("query_value") or ""
+        try:
+            gaia_result = gaia_resolver.resolve_gaia(email)
+        except gaia_resolver.GaiaResolverCredentialError as exc:
+            return jsonify({
+                "error": f"This report can't be regenerated right now: {exc}",
+                "reason": "credential_error",
+            }), 502
+        except Exception:
+            return jsonify({
+                "error": "This report can't be regenerated right now due to an unexpected internal error.",
+                "reason": "internal_error",
+            }), 502
+        if not gaia_result:
+            # Shouldn't happen for a row that already hit a GAIA id once at
+            # search time, but the credential could have died since, or the
+            # Google account could have been deleted — either way this is a
+            # clean, explained failure to regenerate rather than a 404 (the
+            # search_logs row is real and did succeed) or a stack trace.
+            return jsonify({
+                "error": "This report can't be regenerated: no Google account can be resolved for this email anymore.",
+                "reason": "no_match",
+            }), 502
+
+        gaia_id = gaia_result["gaia_id"]
+        try:
+            profile = google_osint.fetch_profile_and_reviews(gaia_id)
+        except google_osint.GoogleOsintError:
+            try:
+                profile = serpapi_fallback.fetch_profile_and_reviews_via_serpapi(gaia_id)
+            except serpapi_fallback.SerpApiQuotaExceededError as exc:
+                return jsonify({
+                    "error": f"This report can't be regenerated right now: the fallback provider is unavailable this month ({exc}).",
+                    "reason": "quota_exceeded",
+                }), 503
+            except serpapi_fallback.SerpApiError as exc:
+                return jsonify({
+                    "error": f"This report can't be regenerated right now: {exc}",
+                    "reason": "lookup_failed",
+                }), 502
+            except Exception:
+                return jsonify({
+                    "error": "This report can't be regenerated right now due to an unexpected internal error.",
+                    "reason": "internal_error",
+                }), 502
+        except Exception:
+            return jsonify({
+                "error": "This report can't be regenerated right now due to an unexpected internal error.",
+                "reason": "internal_error",
+            }), 502
+
+        profile = dict(profile)
+        profile["gaia_id"] = gaia_id
+        pdf_bytes = _build_email_lookup_pdf(log, profile)
+        return Response(
+            pdf_bytes,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=sentinel_email_lookup_{search_log_id}.pdf"},
+        )
+
+    if search_type != "mobile_lookup":
+        conn.close()
+        return jsonify({"error": "PDF reports aren't available for this tool yet."}), 400
 
     query_value = log.get("query_value") or ""
     # Searches run after the normalisation fix log the canonical 10-digit form,
@@ -3848,6 +4455,31 @@ def admin_health():
             health["system"]["ram_percent"] = psutil.virtual_memory().percent
     except Exception as exc:
         health["system"]["error"] = str(exc)
+    return jsonify(health)
+
+
+@app.route("/api/admin/serpapi-usage", methods=["GET"])
+@admin_required
+def admin_serpapi_usage():
+    usage = {"used": 0, "limit": serpapi_fallback.MONTHLY_QUOTA_LIMIT, "period": "unknown", "error": None}
+    try:
+        status = serpapi_fallback.check_quota()
+        usage["used"] = status.get("request_count", 0)
+        usage["limit"] = status.get("limit", serpapi_fallback.MONTHLY_QUOTA_LIMIT)
+        usage["period"] = status.get("year_month", "unknown")
+    except Exception as exc:
+        usage["error"] = str(exc)
+    return jsonify(usage)
+
+
+@app.route("/api/admin/google-credential-health", methods=["GET"])
+@admin_required
+def admin_google_credential_health():
+    health = {"ok": False, "checked_at": None, "error": "unknown"}
+    try:
+        health = gaia_resolver.health_check()
+    except Exception as exc:
+        health = {"ok": False, "checked_at": None, "error": str(exc)}
     return jsonify(health)
 
 

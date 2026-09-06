@@ -20,6 +20,7 @@ Do these in order once the database server is provisioned:
    mysql -u sentinel_user1 -p sentinel_db < migration_activity_log_actor.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_remove_default_admin.sql
    mysql -u sentinel_user1 -p sentinel_db < migration_google_admin_oauth.sql
+   mysql -u sentinel_user1 -p sentinel_db < migration_email_lookup.sql
    ```
    There is no migration runner and no version tracking — nothing records what a given
    database has had applied. Adding a `schema_migrations` table is a Day-4 item.
@@ -129,6 +130,25 @@ harmless *only* for as long as `GOOGLE_OAUTH_*` stay unset on that host —
 before the query ever runs, so nothing breaks until someone sets the three
 Google env vars without having also run this migration by hand first. Do both
 together.
+
+**Critical — the CD pipeline will NOT apply `migration_email_lookup.sql` to
+the live NAS database either.** Same mechanism as above:
+`deploy/db-init/00-apply-schema.sh` only executes when MySQL's
+`docker-entrypoint-initdb.d` fires, and that only happens on an **empty**
+datadir. The live database already has data, so a redeploy will **not** run
+this script and will **not** create the `email_gaia_cache` /
+`serpapi_usage_quota` tables, nor flip `services.status` to `'enabled'` for
+`code='email_lookup'`. It must be applied by hand, once:
+
+```bash
+mysql -u sentinel_user1 -p sentinel_db < migration_email_lookup.sql
+```
+
+This is a separate concern from the `SERPAPI_KEY` credential, which is
+already documented elsewhere in this build as its own pending manual step —
+running this migration by hand brings the catalog row and cache/quota tables
+in line with the code, but does not by itself mean the module is fully live
+on the NAS.
 
 **Authorized account**: as of this writing the only address authorized to use
 the Google button on the live deployment is `kushagr250@gmail.com`. That
