@@ -16,3 +16,5 @@ gunicorn==23.0.0
 
 requests==2.33.0
 google-auth==2.41.1
+
+boto3==1.43.89

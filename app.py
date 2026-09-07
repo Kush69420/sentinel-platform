@@ -82,6 +82,14 @@ except ImportError:
     # requirements.txt, so this only bites a partially-installed environment.
     psutil = None
 
+try:
+    import boto3
+except ImportError:
+    # Optional: only needed for the RDS storage metric in /api/admin/health
+    # (see RDS_INSTANCE_IDENTIFIER below). It is in requirements.txt, so this
+    # only bites a partially-installed environment.
+    boto3 = None
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -207,6 +215,11 @@ if TRUSTED_PROXY_COUNT > 0:
 BASE_DIR = os.path.dirname(__file__)
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# RDS storage metric for /api/admin/health (see .env.example). Unset
+# RDS_INSTANCE_IDENTIFIER falls back to local disk usage via shutil.
+AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+RDS_INSTANCE_IDENTIFIER = os.getenv("RDS_INSTANCE_IDENTIFIER", "")
 
 ALLOWED_EXT = {"png", "jpg", "jpeg", "pdf"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
@@ -4430,6 +4443,51 @@ def public_api_status():
     return jsonify(rows)
 
 
+def _rds_storage_health():
+    """Live DB storage usage for the admin health panel.
+
+    Reports RDS allocated/used storage (AllocatedStorage + the CloudWatch
+    FreeStorageSpace metric) when RDS_INSTANCE_IDENTIFIER is configured —
+    the app's own local disk stopped being where the data lives once the DB
+    moved to RDS, so local disk_usage() no longer means anything useful for
+    an admin checking "are we about to run out of space". Falls back to
+    local disk (e.g. local/dev without RDS) when it isn't.
+    """
+    if RDS_INSTANCE_IDENTIFIER and boto3:
+        try:
+            rds = boto3.client("rds", region_name=AWS_REGION)
+            db = rds.describe_db_instances(DBInstanceIdentifier=RDS_INSTANCE_IDENTIFIER)["DBInstances"][0]
+            total_gb = float(db["AllocatedStorage"])
+            cw = boto3.client("cloudwatch", region_name=AWS_REGION)
+            metrics = cw.get_metric_statistics(
+                Namespace="AWS/RDS", MetricName="FreeStorageSpace",
+                Dimensions=[{"Name": "DBInstanceIdentifier", "Value": RDS_INSTANCE_IDENTIFIER}],
+                StartTime=datetime.utcnow() - timedelta(minutes=30), EndTime=datetime.utcnow(),
+                Period=300, Statistics=["Average"],
+            )
+            points = sorted(metrics.get("Datapoints", []), key=lambda p: p["Timestamp"])
+            if not points:
+                raise RuntimeError("no recent FreeStorageSpace datapoints from CloudWatch")
+            free_gb = points[-1]["Average"] / 1e9
+            used_gb = max(total_gb - free_gb, 0)
+            return {
+                "source": "rds", "identifier": RDS_INSTANCE_IDENTIFIER,
+                "total_gb": round(total_gb, 2), "used_gb": round(used_gb, 2), "free_gb": round(free_gb, 2),
+                "status": "red" if total_gb and used_gb / total_gb > .9 else "green",
+            }
+        except Exception as exc:
+            return {"source": "rds", "identifier": RDS_INSTANCE_IDENTIFIER, "error": str(exc), "status": "yellow"}
+    try:
+        total, used, free = shutil.disk_usage(BASE_DIR)
+        return {
+            "source": "local_disk",
+            "total_gb": round(total / 1e9, 2), "used_gb": round(used / 1e9, 2), "free_gb": round(free / 1e9, 2),
+            "status": "red" if used / total > .9 else "green",
+        }
+    except Exception as exc:
+        return {"source": "local_disk", "error": str(exc), "status": "yellow"}
+
+
 @app.route("/api/admin/health", methods=["GET"])
 @admin_required
 def admin_health():
@@ -4447,9 +4505,8 @@ def admin_health():
         health["apis"] = {"status": "yellow", "message": str(exc)}
     smtp_host = get_setting("smtp_host", "")
     health["smtp"] = {"status": "green" if smtp_host and get_setting("smtp_username", "") else "yellow", "message": "Configured" if smtp_host else "Not configured"}
+    health["system"]["storage"] = _rds_storage_health()
     try:
-        total, used, free = shutil.disk_usage(BASE_DIR)
-        health["system"]["storage"] = {"total_gb": round(total/1e9,2), "used_gb": round(used/1e9,2), "percent": round(used/total*100,1), "status": "red" if used/total > .9 else "green"}
         if psutil:
             health["system"]["cpu_percent"] = psutil.cpu_percent(interval=0.1)
             health["system"]["ram_percent"] = psutil.virtual_memory().percent
